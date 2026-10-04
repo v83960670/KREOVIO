@@ -4,7 +4,7 @@
 
 Kreovio is a trend-intelligence product foundation focused on early discovery: finding movement, measuring it against history, exposing its evidence, and keeping trend score separate from confidence.
 
-> **Honest preview status:** this repository currently builds a polished product preview and the foundations around it. It is **not yet a production trend-intelligence service**. No live data providers, user authentication, PostgreSQL connection, payment processor, or background collection workers are enabled. The app says so in the UI. Sample report values are visibly labelled as illustrative and must not be interpreted as real trends.
+> **Honest status:** Kreovio now runs a real analysis pipeline: official/public collectors, deterministic scoring, credit reserve/commit/release, verified-account authentication, and PostgreSQL persistence (local PGlite, or `DATABASE_URL`). It is **not production-ready**. YouTube, Reddit, and licensed search-trend providers stay `NOT CONFIGURED` until credentials are supplied. News (GDELT), Wikipedia pageviews, and Hacker News are implemented and will report `UNAVAILABLE` if this runtime cannot open TLS to them. Sample report values remain labelled illustrative and are not returned by Trend Search.
 
 ## Run locally
 
@@ -34,13 +34,14 @@ Optional API process settings: copy `.env.example` to `.env` and set `API_HOST` 
 - PostgreSQL transaction helpers in `server/credit-ledger.mjs` for verified free-credit grants, verified payment grants, idempotent search reservations, commit-on-success, and release-on-failure. They are **not wired into the preview API** until authentication and a configured PostgreSQL pool exist.
 - A fail-closed `PaymentService` boundary in `server/payment-service.mjs` with idempotent checkout contracts, HTTPS return-host allowlisting, webhook-signature delegation, minimal event envelopes, and exact server-side payment amount/currency verification. No payment provider adapter or checkout route is registered.
 
-## Preview API
+## API
 
-- `GET /api/health` — preview service health.
-- `GET /api/status` — intentionally reports all data providers as not connected.
-- `GET /api/pricing?currency=INR` — returns the brief’s India plan values. Checkout and billing cadence are not configured.
-- `GET /api/pricing?currency=USD|EUR|GBP|CAD|AUD` — reports that the regional price is not configured; the app does not convert INR at an arbitrary exchange rate.
-- `POST /api/search` — validates the topic, then returns a safe, uncharged “connectors not configured” response in this build.
+- `GET /api/health` — service health and persistence kind.
+- `GET /api/status` — real connector status. Missing credentials are `NOT CONFIGURED`. Failed collections are not relabeled as healthy.
+- `GET /api/pricing?currency=INR` — India plan values from the brief. Checkout is not configured.
+- `POST /api/auth/register`, `/api/auth/verify`, `/api/auth/login`, `/api/auth/me` — server-side accounts. The free search is granted only after verification.
+- `POST /api/search` — authenticated search. Reserves one credit, collects configured sources, and commits only after a valid report. Failure releases the credit. `Accept: text/event-stream` streams real stages.
+- `GET /api/reports/:id` — reopen a stored report. Costs zero credits.
 
 The preview API includes a small in-memory request throttle for local testing. It is **not** a distributed production rate limiter and is not an identity or abuse-control system.
 
@@ -52,25 +53,26 @@ A source adapter must only be added after access rights, provider terms, quota/c
 
 ## Before production
 
-The following work is still required; the included schema and helpers are foundations, not a claim these services are live:
+Authentication, the credit ledger, and PostgreSQL persistence are wired. The following is still required before calling the service production-ready:
 
-1. Choose and integrate secure verified-email authentication and server-side authorization.
-2. Provision PostgreSQL, apply reviewed migrations, seed admin-managed plans/prices, wire the ledger helpers, and add transaction/integration tests.
-3. Implement and operate permitted/licensed source adapters plus historical snapshots, deduplication, clustering, geographic coverage, evaluation, and source-health jobs.
-4. Add a durable queue/cache, cost aggregation, distributed rate limiting, concurrency and fair-use controls, operational alerts, and data-retention/deletion workflows.
-5. Add payment-provider adapters (UPI/cards/PayPal as eligible), authenticated checkout, signature-verified webhooks, idempotency/reconciliation, refunds, taxes, and explicit billing/renewal terms. The preview has no checkout.
-6. Configure regional price records in a protected admin system; international prices are deliberately unpublished until configured.
-7. Complete security review, privacy/terms, export/deletion, observability, load tests, and deployment-specific CSP/CSRF controls.
+1. Provision managed PostgreSQL and set `DATABASE_URL`. Local PGlite is real PostgreSQL SQL for development, not a managed production database.
+2. Supply `YOUTUBE_API_KEY`, Reddit OAuth credentials, and a licensed search-trend key such as `SERPAPI_API_KEY`. Without them those connectors stay `NOT CONFIGURED`.
+3. Run the API somewhere that can open TLS to GDELT, Wikimedia, and Hacker News. This sandbox cannot; those connectors then report `UNAVAILABLE` and invent nothing.
+4. Wire SMTP. Verification currently uses a local mailbox token when `SMTP_URL` is unset.
+5. Add payment-provider adapters, webhook signature checks, and server-verified checkout. The payment boundary is fail-closed and no checkout is registered.
+6. Replace the in-process cache/worker with a durable queue, distributed rate limiting, retention jobs, and operational alerts.
+7. Complete privacy/terms, export/deletion, load tests, and a deployment CSP review.
 
 ## Repository layout
 
 ```text
-src/                     React product experience and styles
-server/index.mjs          Preview-only HTTP API
-server/trend-engine.mjs   Deterministic scoring and normalization primitives
-server/credit-ledger.mjs  PostgreSQL transaction helpers (not preview-wired)
-server/payment-service.mjs Provider-neutral, fail-closed payment boundary
-server/pricing.mjs        Preview price configuration
-server/*.test.mjs         Node test suite
-db/schema.sql             PostgreSQL starting schema
+src/                      Product experience. Sample reports stay labeled and are not search results.
+server/index.mjs          HTTP API, auth cookies, SSE search progress
+server/search-service.mjs Credit-gated search orchestration
+server/analyze.mjs        Evidence assembly. No LLM scoring.
+server/sources/           YouTube, Reddit, search, GDELT, Wikipedia, Hacker News adapters
+server/trend-engine.mjs   Deterministic KTS-1.0 primitives
+server/credit-ledger.mjs  PostgreSQL reserve / commit / release
+server/db.mjs             PGlite or DATABASE_URL
+db/schema.sql             PostgreSQL schema
 ```

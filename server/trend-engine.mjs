@@ -302,25 +302,6 @@ export function determineLifecycle({
   return 'emerging';
 }
 
-export function isEarlySignal({
-  hoursSinceDetection,
-  acceleration,
-  confidence,
-  saturation,
-  independentSources,
-  sampleSize,
-  score,
-} = {}) {
-  return isNumber(hoursSinceDetection)
-    && hoursSinceDetection <= 72
-    && isNumber(acceleration) && acceleration >= 0.67
-    && isNumber(confidence) && confidence >= 70
-    && isNumber(saturation) && saturation <= 0.4
-    && isNumber(independentSources) && independentSources >= 2
-    && isNumber(sampleSize) && sampleSize >= 10
-    && isNumber(score) && score >= 55;
-}
-
 export function getSupportedWindows(historicalDays = 0) {
   const windows = [
     { id: '6h', label: 'Past 6 hours', minDays: 0.25 },
@@ -331,4 +312,223 @@ export function getSupportedWindows(historicalDays = 0) {
     { id: '90d', label: 'Past 90 days', minDays: 90 },
   ];
   return windows.filter((window) => historicalDays >= window.minDays);
+}
+
+export const DEFAULT_EARLY_SIGNAL = Object.freeze({
+  maxHours: 72,
+  minAcceleration: 0.67,
+  minConfidence: 70,
+  maxSaturation: 0.4,
+  minIndependentSources: 2,
+  minSampleSize: 10,
+  minScore: 55,
+});
+
+const STOPWORDS = new Set('a an the of and or to in for on with from by at as is are was were be this that it its into about over after before vs via than then not no nor but if so such their they them you your our we can may will just more most other also than per via'.split(' '));
+const GENERIC_TOPIC_TOKENS = new Set(['ai', 'artificial', 'intelligence', 'model', 'models', 'tech', 'technology', 'news', 'india', 'indian', 'update', 'updates', 'report', 'reports', 'said', 'says', 'internet', 'online', 'digital', 'data']);
+
+function stemToken(word) {
+  if (word.length > 4 && word.endsWith('ies')) return `${word.slice(0, -3)}y`;
+  if (word.length > 3 && word.endsWith('s') && !word.endsWith('ss')) return word.slice(0, -1);
+  return word;
+}
+
+export function distinctiveTokens(text = '', query = '') {
+  const queryTokens = new Set(normalizeTopic(query).split(' ').map(stemToken));
+  return [...new Set(normalizeTopic(text).split(' ')
+    .map(stemToken)
+    .filter((word) => word.length > 2 && !STOPWORDS.has(word) && !queryTokens.has(word) && !GENERIC_TOPIC_TOKENS.has(word)))];
+}
+
+function jaccardSets(left, right) {
+  if (!left.size || !right.size) return 0;
+  let overlap = 0;
+  for (const token of left) if (right.has(token)) overlap += 1;
+  return overlap / (left.size + right.size - overlap);
+}
+
+/**
+ * Conservative lexical clustering. Shared generic tokens such as "ai" are removed
+ * before comparison so "AI agents" and "AI regulation" stay separate.
+ */
+export function clusterSignals(signals = [], { query = '', similarity = 0.5 } = {}) {
+  const clusters = [];
+  for (const signal of signals) {
+    const title = String(signal.title ?? signal.topic ?? '').trim();
+    if (!title) continue;
+    const tokens = new Set(distinctiveTokens(title, query));
+    let best = null;
+    let bestScore = 0;
+    if (tokens.size) {
+      for (const cluster of clusters) {
+        const score = jaccardSets(tokens, cluster.tokens);
+        const shared = [...tokens].filter((token) => cluster.tokens.has(token));
+        const related = shared.length >= 2 || (shared.length >= 1 && score >= similarity);
+        if (related && score > bestScore) {
+          best = cluster;
+          bestScore = score;
+        }
+      }
+    }
+    if (best) {
+      best.items.push(signal);
+      best.titles.push(title);
+      for (const token of tokens) best.tokens.add(token);
+      best.score = Math.max(best.score, bestScore);
+    } else {
+      clusters.push({ tokens, items: [signal], titles: [title], score: 1 });
+    }
+  }
+  return clusters.map((cluster, index) => {
+    const canonical = cluster.titles.slice().sort((a, b) => a.length - b.length)[0];
+    return {
+      id: `cluster-${index + 1}`,
+      canonicalName: canonical,
+      aliases: [...new Set(cluster.titles.filter((title) => normalizeTopic(title) !== normalizeTopic(canonical)))],
+      items: cluster.items,
+      similarity: Number(cluster.score.toFixed(4)),
+    };
+  });
+}
+
+/** Count independent confirmations after duplicate collapse. Mirrors do not each count. */
+export function independentConfirmations(signals = []) {
+  const deduped = deduplicateSignals(signals);
+  const groups = new Set();
+  for (const signal of deduped) {
+    const publishers = signal.independentSourceIds?.length ? signal.independentSourceIds : [];
+    if (publishers.length <= 1) {
+      groups.add(`story:${normalizeTopic(signal.title)}:${publishers[0] ?? signal.source ?? 'unknown'}`);
+    } else {
+      // Syndicated copies share one story. They confirm the story once per source family, not once per mirror.
+      groups.add(`story:${normalizeTopic(signal.title)}:${signal.source ?? 'unknown'}`);
+    }
+  }
+  return { stories: deduped.length, independentCount: groups.size, duplicatesRemoved: signals.length - deduped.length };
+}
+
+/**
+ * Acceleration from a series of growth increments.
+ * +4, +12, +35 accelerates. +20, +20, +20 grows without acceleration.
+ * Returns null when fewer than three increments exist or the scale is too small to trust.
+ * 0.5 means flat acceleration. Above 0.5 means the rate of growth is increasing.
+ */
+export function calculateAccelerationFromIncrements(increments, { minimumScale = 10 } = {}) {
+  if (!Array.isArray(increments) || increments.length < 3 || increments.some((value) => !isNumber(value))) return null;
+  const scale = Math.max(...increments.map((value) => Math.abs(value)));
+  if (scale < minimumScale) return null;
+  const changes = [];
+  for (let index = 1; index < increments.length; index += 1) changes.push(increments[index] - increments[index - 1]);
+  const meanChange = changes.reduce((sum, value) => sum + value, 0) / changes.length;
+  return Number(clamp(0.5 + (meanChange / scale) * 0.9).toFixed(4));
+}
+
+/** Acceleration from absolute observations. One or two snapshots are not enough. */
+export function calculateSeriesAcceleration(series = [], options = {}) {
+  const points = (series ?? []).map((point) => typeof point === 'number' ? point : point?.value).filter(isNumber);
+  if (points.length < 4) return null;
+  const increments = [];
+  for (let index = 1; index < points.length; index += 1) increments.push(points[index] - points[index - 1]);
+  return calculateAccelerationFromIncrements(increments, options);
+}
+
+export function episodeFreshnessLabel(hoursSinceEpisode) {
+  if (!isNumber(hoursSinceEpisode) || hoursSinceEpisode < 0) return 'UNAVAILABLE';
+  if (hoursSinceEpisode <= 1) return 'JUST DETECTED';
+  if (hoursSinceEpisode <= 6) return '<6 HOURS';
+  if (hoursSinceEpisode <= 24) return '6–24 HOURS';
+  if (hoursSinceEpisode <= 72) return '1–3 DAYS';
+  if (hoursSinceEpisode <= 168) return '3–7 DAYS';
+  return 'ESTABLISHED';
+}
+
+export function saturationLabel(value) {
+  if (!isNumber(value)) return 'INSUFFICIENT EVIDENCE';
+  if (value >= 0.75) return 'LOW';
+  if (value >= 0.5) return 'MEDIUM';
+  if (value >= 0.25) return 'HIGH';
+  return 'VERY HIGH';
+}
+
+export function classifySourceFreshness({ ageSeconds, connectorStatus, thresholds }) {
+  if (connectorStatus === 'NOT_CONFIGURED') return 'NOT CONFIGURED';
+  if (connectorStatus === 'AUTHENTICATION_ERROR') return 'UNAVAILABLE';
+  if (!isNumber(ageSeconds)) {
+    if (connectorStatus === 'RATE_LIMITED' || connectorStatus === 'DEGRADED') return 'DEGRADED';
+    return 'UNAVAILABLE';
+  }
+  const limits = thresholds ?? { liveSec: 15 * 60, nearLiveSec: 60 * 60, recentSec: 6 * 60 * 60, staleSec: 24 * 60 * 60 };
+  let label = 'STALE';
+  if (ageSeconds <= limits.liveSec) label = 'LIVE';
+  else if (ageSeconds <= limits.nearLiveSec) label = 'NEAR LIVE';
+  else if (ageSeconds <= limits.recentSec) label = 'RECENT';
+  else label = 'STALE';
+  if (connectorStatus === 'DEGRADED' || connectorStatus === 'RATE_LIMITED' || connectorStatus === 'UNAVAILABLE') {
+    return label === 'LIVE' || label === 'NEAR LIVE' ? 'DEGRADED' : label;
+  }
+  return label;
+}
+
+export function scoreWithProvenance(features = {}, weights = DEFAULT_WEIGHTS) {
+  const result = calculateTrendScore(features, weights);
+  const observedWeight = Object.entries(weights).reduce((sum, [dimension, weight]) => (
+    isNumber(features[dimension]) && isNumber(weight) && weight > 0 ? sum + weight : sum
+  ), 0);
+  const dimensions = {};
+  for (const [dimension, weight] of Object.entries(weights)) {
+    const value = features[dimension];
+    const observed = isNumber(value) && isNumber(weight) && weight > 0;
+    dimensions[dimension] = {
+      value: observed ? Number(clamp(value).toFixed(4)) : null,
+      weight,
+      status: observed ? 'observed' : 'unavailable',
+      contribution: observed && result.score != null && observedWeight > 0
+        ? Number(((clamp(value) * weight / observedWeight) * 100).toFixed(2))
+        : null,
+    };
+  }
+  return { ...result, dimensions };
+}
+
+export function isEarlySignal(input = {}, thresholds = DEFAULT_EARLY_SIGNAL) {
+  const rules = { ...DEFAULT_EARLY_SIGNAL, ...thresholds };
+  return isNumber(input.hoursSinceDetection)
+    && input.hoursSinceDetection <= rules.maxHours
+    && isNumber(input.acceleration) && input.acceleration >= rules.minAcceleration
+    && isNumber(input.confidence) && input.confidence >= rules.minConfidence
+    && isNumber(input.saturation) && input.saturation <= rules.maxSaturation
+    && isNumber(input.independentSources) && input.independentSources >= rules.minIndependentSources
+    && isNumber(input.sampleSize) && input.sampleSize >= rules.minSampleSize
+    && isNumber(input.score) && input.score >= rules.minScore;
+}
+
+const NUMBER_PATTERN = /(?<![A-Za-z0-9])\d[\d,]*(?:\.\d+)?%?/g;
+
+export function numbersInText(text = '') {
+  return [...String(text).matchAll(NUMBER_PATTERN)].map((match) => match[0]);
+}
+
+/** Reject an explanation sentence that introduces a number absent from the evidence allowlist. */
+export function groundExplanation(text, allowedNumbers = []) {
+  const allowed = new Set();
+  for (const value of allowedNumbers) {
+    if (!isNumber(value) && typeof value !== 'string') continue;
+    const raw = String(value);
+    allowed.add(raw);
+    allowed.add(raw.replace(/\.0$/, ''));
+    if (isNumber(Number(value))) {
+      const rounded = String(Math.round(Number(value)));
+      allowed.add(rounded);
+      allowed.add(`${rounded}%`);
+    }
+  }
+  const sentences = String(text ?? '').split(/(?<=[.!?])\s+/).filter(Boolean);
+  const kept = [];
+  const removed = [];
+  for (const sentence of sentences) {
+    const unsupported = numbersInText(sentence).filter((token) => !allowed.has(token) && !allowed.has(token.replace(/,/g, '')));
+    if (unsupported.length) removed.push({ sentence, unsupported });
+    else kept.push(sentence);
+  }
+  return { text: kept.join(' ').trim(), removed };
 }

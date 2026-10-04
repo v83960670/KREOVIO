@@ -117,7 +117,7 @@ export async function reserveSearch(pool, {
   if (typeof languageCode !== 'string' || !/^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?$/.test(languageCode)) {
     throw safeError('INVALID_LANGUAGE', 'Choose a supported language.');
   }
-  if (!['all', 'search', 'youtube', 'reddit', 'news'].includes(sourceFilter)) {
+  if (!['all', 'search', 'youtube', 'reddit', 'news', 'wikipedia', 'hackernews'].includes(sourceFilter)) {
     throw safeError('INVALID_SOURCE_FILTER', 'The requested source filter is not supported.');
   }
 
