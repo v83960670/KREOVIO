@@ -1,5 +1,8 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import TrendCoreWebGL from './TrendCoreWebGL';
+import AuthPanel from './auth-panel';
+import { ApiError, STAGE_LABELS, api, formatAge, streamSearch, type Account } from './api';
+import { LiveModal, LiveTrendCard, LiveUniverse, palette, type LiveReport, type LiveTrend } from './live-report';
 import {
   Activity,
   ArrowDown,
@@ -58,9 +61,12 @@ const SOURCES = [
   { value: 'youtube', label: 'YouTube' },
   { value: 'reddit', label: 'Reddit' },
   { value: 'news', label: 'News' },
+  { value: 'wikipedia', label: 'Wikipedia attention' },
+  { value: 'hackernews', label: 'Hacker News' },
 ];
 
 const TIME_WINDOWS = [
+  { value: '1h', label: 'Past hour' },
   { value: '6h', label: 'Past 6 hours' },
   { value: '24h', label: 'Past 24 hours' },
   { value: '3d', label: 'Past 3 days' },
@@ -69,8 +75,8 @@ const TIME_WINDOWS = [
   { value: '90d', label: 'Past 90 days' },
 ];
 
-type Connector = { id: string; name: string; status: string; note: string };
-type ApiStatus = { mode: string; liveSearchEnabled: boolean; connectors: Connector[]; message: string };
+type Connector = { id: string; name: string; status: string; note: string; liveStatus?: string; lastSuccessAt?: string | null; latestSignalAt?: string | null };
+type ApiStatus = { mode: string; liveSearchEnabled: boolean; connectors: Connector[]; message: string; persistence?: string };
 type Plan = { id: string; name: string; price: number; searches: number | null; unit: string; description: string; featured?: boolean };
 type Pricing = { currency: string; configured: boolean; billingTermsConfigured?: boolean; plans: Plan[]; note: string };
 type Trend = {
@@ -505,12 +511,17 @@ function App() {
   const [pricing, setPricing] = useState<Pricing | null>(null);
   const [currency, setCurrency] = useState('INR');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [mode, setMode] = useState('discover');
   const [searchMessage, setSearchMessage] = useState('');
   const [searchError, setSearchError] = useState(false);
   const [reportVisible, setReportVisible] = useState(false);
   const [reportView, setReportView] = useState<'list' | 'universe'>('list');
   const [activeTrend, setActiveTrend] = useState<Trend | null>(null);
   const [savedExamples, setSavedExamples] = useState<string[]>([]);
+  const [account, setAccount] = useState<Account | null>(null);
+  const [liveReport, setLiveReport] = useState<LiveReport | null>(null);
+  const [activeLive, setActiveLive] = useState<LiveTrend | null>(null);
+  const [stages, setStages] = useState<string[]>([]);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [menuStatusOpen, setMenuStatusOpen] = useState(false);
   const finderRef = useRef<HTMLElement>(null);
@@ -519,8 +530,9 @@ function App() {
 
   useEffect(() => {
     fetch('/api/status').then((response) => response.json()).then((data: ApiStatus) => setStatus(data)).catch(() => {
-      setStatus({ mode: 'preview', liveSearchEnabled: false, connectors: [], message: 'The preview API is unavailable. Live searches remain disabled and uncharged.' });
+      setStatus({ mode: 'analysis', liveSearchEnabled: false, connectors: [], message: 'The analysis API is unavailable. A search was not run and nothing was charged.' });
     });
+    api<Account>('/api/auth/me').then(setAccount).catch(() => setAccount({ authenticated: false }));
   }, []);
 
   useEffect(() => {
@@ -559,28 +571,42 @@ function App() {
       searchInputRef.current?.focus();
       return;
     }
+    if (!account?.authenticated || !account.csrf) {
+      setSearchError(true);
+      setSearchMessage('Sign in with a verified account before scanning. Nothing was charged.');
+      return;
+    }
+    if (!account.emailVerified) {
+      setSearchError(true);
+      setSearchMessage('Verify the account before the free search can be reserved. Nothing was charged.');
+      return;
+    }
     setIsSubmitting(true);
-    setSearchMessage('Checking provider readiness…');
+    setStages([]);
+    setSearchMessage('');
     setSearchError(false);
     try {
-      const response = await fetch('/api/search', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: cleanQuery, country, language, source, timeWindow: windowId }),
+      const report = await streamSearch({ mode, query: cleanQuery, country, language, source, timeWindow: windowId }, account.csrf, (name, data) => {
+        if (name === 'source_completed') {
+          const sourceId = String(data.id ?? 'source');
+          const sourceStatus = String(data.status ?? '').replaceAll('_', ' ').toLowerCase();
+          setStages((current) => [...current, `${sourceId}: ${sourceStatus}`]);
+          return;
+        }
+        const label = STAGE_LABELS[name];
+        if (label) setStages((current) => current.includes(label) ? current : [...current, label]);
       });
-      const payload = await response.json();
-      if (!response.ok || !payload.results) {
-        setSearchError(true);
-        setSearchMessage(payload.message ?? 'Live source access is not available. Your search was not charged.');
-      } else {
-        setSearchError(false);
-        setSearchMessage('Search complete. Open the report below.');
-        setReportVisible(true);
-        window.setTimeout(() => reportRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80);
-      }
-    } catch {
+      if (!report) throw new ApiError('The search ended without a report. Nothing was charged if collection failed.', 500);
+      setLiveReport(report as LiveReport);
+      setSearchError(report.charged === false);
+      setSearchMessage(`${String(report.message ?? 'Analysis complete.')}${report.charged ? ' One credit was committed.' : ' Your search was not charged.'}`);
+      const me = await api<Account>('/api/auth/me');
+      setAccount(me);
+      window.setTimeout(() => reportRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80);
+    } catch (reason) {
       setSearchError(true);
-      setSearchMessage('Signal interrupted. Live provider access is unavailable in this preview; nothing was charged.');
+      setSearchMessage(reason instanceof ApiError ? `${reason.message} Nothing was charged unless a report was completed.` : 'Signal interrupted. Nothing was charged.');
+      api<Account>('/api/auth/me').then(setAccount).catch(() => undefined);
     } finally {
       setIsSubmitting(false);
     }
@@ -614,7 +640,7 @@ function App() {
           </nav>
           <div className="header-actions">
             <button className={`network-pill${menuStatusOpen ? ' network-pill-open' : ''}`} onClick={() => setMenuStatusOpen((open) => !open)} aria-expanded={menuStatusOpen} aria-controls="network-status-panel">
-              <span className="network-pill-light" /><span>Preview build</span><ChevronDown size={13} />
+              <span className="network-pill-light" /><span>{status?.liveSearchEnabled ? 'Sources mixed' : 'Sources unavailable'}</span><ChevronDown size={13} />
             </button>
             <button className="header-cta" onClick={() => scrollToFinder(true)}>Explore <ArrowUpRight size={15} /></button>
             <button className="mobile-menu-toggle icon-button" aria-label={mobileMenuOpen ? 'Close navigation' : 'Open navigation'} aria-expanded={mobileMenuOpen} onClick={() => setMobileMenuOpen((open) => !open)}>{mobileMenuOpen ? <X size={20} /> : <Menu size={20} />}</button>
@@ -624,7 +650,7 @@ function App() {
           <div className="network-popover" id="network-status-panel">
             <div className="popover-header"><span className="status-dot muted" /> CONNECTOR STATUS <button className="icon-button" onClick={() => setMenuStatusOpen(false)} aria-label="Close connector status"><X size={15} /></button></div>
             <p>{status?.message ?? 'Checking source readiness…'}</p>
-            <div className="popover-connectors">{(status?.connectors ?? []).map((connector) => <span key={connector.id}><i />{connector.name}<em>Not connected</em></span>)}</div>
+            <div className="popover-connectors">{(status?.connectors ?? []).map((connector) => <span key={connector.id}><i />{connector.name}<em>{connector.liveStatus ?? connector.status}</em></span>)}</div>
             <a href="#trust" onClick={() => setMenuStatusOpen(false)}>Read the data policy <ArrowRight size={13} /></a>
           </div>
         )}
@@ -637,7 +663,7 @@ function App() {
             <div className="hero-copy">
               <div className="eyebrow hero-eyebrow"><span className="eyebrow-signal"><span /></span> INTERNET TREND INTELLIGENCE <span className="eyebrow-index">/ 01</span></div>
               <h1 id="hero-title">See what’s<br />rising <span>before</span><br />everyone else.</h1>
-              <p className="hero-subtitle">Real-time trend intelligence for people who need to know what the internet is paying attention to.</p>
+              <p className="hero-subtitle">Near-live trend intelligence for people who need to know what the internet is paying attention to — with the freshness of every source shown.</p>
               <p className="hero-detail">Find the early movement. Understand why it’s moving. See the evidence behind every signal.</p>
               <div className="hero-actions">
                 <button className="button button-primary" onClick={() => scrollToFinder(true)}>Find my first trend <ArrowRight size={17} /></button>
@@ -658,13 +684,17 @@ function App() {
         <section className="finder-section section-shell" id="finder" ref={finderRef} aria-labelledby="finder-title">
           <div className="section-heading finder-heading">
             <div><div className="eyebrow"><span className="section-index">01</span> THE TREND FINDER</div><h2 id="finder-title">Start with a question.<br /><span>Leave with a signal.</span></h2></div>
-            <div className="section-heading-aside"><span className="engine-status"><span className="status-dot muted" /> PREVIEW ENVIRONMENT</span><p>Live source connections are not configured yet. This interface won’t invent a result or charge for a failed scan.</p></div>
+            <div className="section-heading-aside"><span className="engine-status"><span className="status-dot muted" /> {status?.persistence === 'pglite' ? 'LOCAL POSTGRES' : status?.persistence === 'postgres' ? 'POSTGRES' : 'CHECKING STORAGE'}</span><p>{status?.message ?? 'Source status is loaded from the server. Missing credentials stay missing. Failed scans are not charged.'}</p></div>
           </div>
 
           <div className="finder-layout">
             <form className="search-console" onSubmit={submitSearch} noValidate>
-              <div className="console-topline"><span><Radio size={14} /> INTELLIGENCE ENGINE</span><span className="console-mode">NO LIVE FEED <i /></span></div>
-              <label className="query-label" htmlFor="trend-query">What do you want to explore?</label>
+              <div className="console-topline"><span><Radio size={14} /> INTELLIGENCE ENGINE</span><span className="console-mode">{status?.liveSearchEnabled ? 'FRESHNESS SHOWN' : 'SOURCES LIMITED'} <i /></span></div>
+              <div className="view-toggle" role="group" aria-label="Search mode">
+                <button type="button" className={mode === 'discover' ? 'active' : ''} aria-pressed={mode === 'discover'} onClick={() => setMode('discover')}>Discover niches</button>
+                <button type="button" className={mode === 'analyze' ? 'active' : ''} aria-pressed={mode === 'analyze'} onClick={() => setMode('analyze')}>Analyze topic</button>
+              </div>
+              <label className="query-label" htmlFor="trend-query">{mode === 'discover' ? 'Which broad category do you want to explore?' : 'Which topic do you want to analyze?'}</label>
               <div className={`query-input-wrap${searchError && !query.trim() ? ' input-error' : ''}`}>
                 <Search size={21} aria-hidden="true" />
                 <input id="trend-query" ref={searchInputRef} type="text" maxLength={100} placeholder="A topic, niche or question…" value={query} onChange={(event) => { setQuery(event.target.value); if (searchMessage) setSearchMessage(''); }} aria-describedby="query-help search-feedback" />
@@ -679,9 +709,10 @@ function App() {
                 <SelectField label="TIME WINDOW" value={windowId} options={TIME_WINDOWS} onChange={setWindowId} icon={Clock3} />
               </div>
               <div className="console-actions">
-                <button className="button button-primary scan-button" type="submit" disabled={isSubmitting}><span className="scan-button-icon">{isSubmitting ? <span className="button-pulse" /> : <Sparkles size={17} />}</span>{isSubmitting ? 'Checking access…' : 'Scan for emerging trends'}<ArrowRight size={17} /></button>
+                <button className="button button-primary scan-button" type="submit" disabled={isSubmitting}><span className="scan-button-icon">{isSubmitting ? <span className="button-pulse" /> : <Sparkles size={17} />}</span>{isSubmitting ? 'Collecting signals…' : mode === 'discover' ? 'Discover rising niches' : 'Analyze topic'}<ArrowRight size={17} /></button>
                 <span className="scan-cost"><LockKeyhole size={13} /> One search · one complete analysis</span>
               </div>
+              {stages.length > 0 && <ol className="search-stages" aria-label="Search progress">{stages.map((stage) => <li key={stage}>{stage}</li>)}</ol>}
               <div id="search-feedback" className={`search-feedback${searchMessage ? ' is-visible' : ''}${searchError ? ' feedback-error' : ' feedback-info'}`} aria-live="polite" role={searchError ? 'alert' : 'status'}>
                 {searchMessage && <><span className="feedback-symbol">{searchError ? <CircleHelp size={15} /> : <Activity size={15} />}</span><span>{searchMessage}</span>{searchError && <span className="not-charged">NOT CHARGED</span>}</>}
               </div>
@@ -689,11 +720,38 @@ function App() {
             </form>
 
             <aside className="finder-aside">
-              <div className="free-search-card"><div className="free-search-icon"><Zap size={17} /></div><span className="eyebrow">YOUR FIRST SIGNAL</span><strong>One real search.<br /><em>No card required.</em></strong><p>The free search is designed to show the complete report—not a teaser. It becomes available when an account and live data sources are connected.</p><div className="free-search-bottom"><span><span className="status-dot muted" /> NOT ACTIVE IN PREVIEW</span><span>01 / 01</span></div></div>
+              <div className="free-search-card"><div className="free-search-icon"><Zap size={17} /></div><span className="eyebrow">YOUR FIRST SIGNAL</span><strong>One real search.<br /><em>No card required.</em></strong><p>A verified account receives one Trend Search. The balance is stored on the server. Opening a finished report does not spend another credit.</p><div className="free-search-bottom"><span><span className="status-dot" /> {account?.authenticated ? `${account.creditsAvailable ?? 0} AVAILABLE` : 'SIGN IN TO RESERVE'}</span><span>01 / 01</span></div></div>
+              <AuthPanel account={account} onChange={setAccount} />
               <div className="sample-prompt-card"><span className="eyebrow">WANT TO SEE THE EXPERIENCE?</span><p>Explore an annotated sample report. Every number is clearly marked as illustrative.</p><button onClick={loadExample}>Open sample report <ArrowRight size={15} /></button></div>
             </aside>
           </div>
         </section>
+
+        {liveReport && (
+          <section className="report-section section-shell" id="report" ref={reportRef} aria-labelledby="live-report-title">
+            <div className="report-section-top"><div><div className="eyebrow"><span className="section-index">02</span> TREND REPORT</div><h2 id="live-report-title">{liveReport.results.length ? <>What is moving in <span>{liveReport.query}.</span></> : <>No strong acceleration <span>detected yet.</span></>}</h2></div><button className="icon-button report-close" onClick={() => setLiveReport(null)} aria-label="Close report"><X size={17} /></button></div>
+            <div className="freshness-bar">
+              <span>Analysis {formatAge(liveReport.analysisCompletedAt)}</span>
+              <span>Latest signal {liveReport.latestSignalAt ? formatAge(liveReport.latestSignalAt) : 'unavailable'}</span>
+              <span>{liveReport.charged ? '1 credit committed' : '0 credits committed'}</span>
+              <span>{liveReport.stats ? `${liveReport.stats.signalsCollected} signals · ${liveReport.stats.duplicatesRemoved} duplicates removed` : 'No collection stats'}</span>
+            </div>
+            <div className="source-freshness-row">{liveReport.sourceFreshness.map((source) => <div key={source.id}><strong>{source.name}</strong><em>{source.liveStatus}</em><small>{source.status.replaceAll('_', ' ')} · {formatAge(source.lastSuccessAt ?? source.latestSignalAt)}</small></div>)}</div>
+            {liveReport.message && <div className="report-demo-notice"><div className="demo-notice-icon"><CircleHelp size={17} /></div><div><strong>{liveReport.code === 'INSUFFICIENT_EVIDENCE' ? 'Search could not be completed.' : 'Analysis note'}</strong><p>{liveReport.message}</p>{!!liveReport.warnings?.length && <ul className="why-list">{liveReport.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>}</div></div>}
+            {liveReport.results.length > 0 && (
+              <>
+                <div className="report-toolbar"><div><span className="report-query-icon"><Search size={14} /></span><strong>{liveReport.query}</strong><span className="report-filters">{liveReport.country} <i /> {liveReport.language} <i /> {liveReport.timeWindow}</span></div><div className="report-toolbar-actions"><div className="view-toggle" role="group" aria-label="Report view"><button className={reportView === 'list' ? 'active' : ''} onClick={() => setReportView('list')} aria-pressed={reportView === 'list'}>List</button><button className={reportView === 'universe' ? 'active' : ''} onClick={() => setReportView('universe')} aria-pressed={reportView === 'universe'}>Universe</button></div></div></div>
+                {reportView === 'list' ? <div className="trend-card-grid">{liveReport.results.map((trend, index) => <LiveTrendCard key={trend.trendId} trend={trend} color={palette(index)} onOpen={() => setActiveLive(trend)} />)}</div> : <LiveUniverse trends={liveReport.results} onOpen={setActiveLive} />}
+              </>
+            )}
+            {liveReport.topicAssessment && (
+              <div className="topic-assessment"><span className="eyebrow">QUERY TOPIC · NOT RANKED AS EARLY</span><h3>{liveReport.topicAssessment.name}</h3><p>{liveReport.topicAssessment.explanation?.text}</p><span>Lifecycle {String(liveReport.topicAssessment.lifecycle).toUpperCase()} · score {liveReport.topicAssessment.score ?? 'withheld'}</span></div>
+            )}
+            {!!liveReport.observations?.length && (
+              <div className="observation-list"><span className="eyebrow">OBSERVED, NOT SCORED</span>{liveReport.observations.map((item) => <p key={item.name}><strong>{item.name}</strong> — {item.reason}</p>)}</div>
+            )}
+          </section>
+        )}
 
         {reportVisible && (
           <section className="report-section section-shell" id="report" ref={reportRef} aria-labelledby="report-title">
@@ -723,16 +781,16 @@ function App() {
         <section className="trust-section section-shell" id="trust" aria-labelledby="trust-title">
           <div className="trust-heading"><div><div className="eyebrow"><span className="section-index">04</span> TRUST IS THE INTERFACE</div><h2 id="trust-title">No black boxes.<br /><span>No pretend certainty.</span></h2></div><p>Every trend should earn its place. If the underlying data can’t support a useful answer, Kreovio should say so plainly.</p></div>
           <div className="trust-grid">
-            <article className="trust-card"><span className="trust-number">01</span><div className="trust-icon"><Radio size={19} /></div><h3>Sources stay visible.</h3><p>Each result is designed to show its provider, timestamp, signal type and reference—so a user can inspect the reason, not just the conclusion.</p><span className="trust-card-foot"><LockKeyhole size={13} /> CONNECTORS NOT CONFIGURED</span></article>
+            <article className="trust-card"><span className="trust-number">01</span><div className="trust-icon"><Radio size={19} /></div><h3>Sources stay visible.</h3><p>Each result is designed to show its provider, timestamp, signal type and reference—so a user can inspect the reason, not just the conclusion.</p><span className="trust-card-foot"><LockKeyhole size={13} /> STATUS COMES FROM THE SERVER</span></article>
             <article className="trust-card"><span className="trust-number">02</span><div className="trust-icon trust-icon-purple"><Activity size={19} /></div><h3>Momentum isn’t popularity.</h3><p>Velocity, acceleration and lifecycle are measured against historical attention. A large number alone isn’t an early signal.</p><span className="trust-card-foot"><Check size={13} /> ALGORITHMIC SCORING</span></article>
             <article className="trust-card"><span className="trust-number">03</span><div className="trust-icon trust-icon-peach"><ShieldCheck size={19} /></div><h3>Evidence before explanation.</h3><p>AI may summarize what sources show. It does not invent metrics, choose a score or fill gaps in the record.</p><span className="trust-card-foot"><Check size={13} /> EVIDENCE-GROUNDED BY DESIGN</span></article>
           </div>
-          <div className="source-readiness"><div className="source-readiness-title"><span className="eyebrow">SOURCE READINESS</span><span className="source-readiness-note"><span className="status-dot muted" /> Preview only</span></div><div className="source-readiness-grid">{(status?.connectors ?? [
-            { id: 'search-interest', name: 'Search interest', note: 'Waiting for authorized provider access.' },
-            { id: 'youtube', name: 'YouTube', note: 'Waiting for official API credentials.' },
-            { id: 'reddit', name: 'Reddit', note: 'Waiting for approved OAuth access.' },
-            { id: 'news', name: 'News', note: 'Waiting for licensed data access.' },
-          ]).map((connector) => <div className="source-readiness-item" key={connector.id}><span className="source-ready-icon"><Radio size={15} /></span><span><strong>{connector.name}</strong><small>{connector.note}</small></span><span className="source-disconnected">NOT CONNECTED</span></div>)}</div></div>
+          <div className="source-readiness"><div className="source-readiness-title"><span className="eyebrow">SOURCE READINESS</span><span className="source-readiness-note"><span className="status-dot muted" /> From the server</span></div><div className="source-readiness-grid">{(status?.connectors ?? [
+            { id: 'search', name: 'Search interest', status: 'NOT_CONFIGURED', liveStatus: 'NOT CONFIGURED', note: 'Waiting for a licensed search-trend key.' },
+            { id: 'youtube', name: 'YouTube', status: 'NOT_CONFIGURED', liveStatus: 'NOT CONFIGURED', note: 'Waiting for an official API key.' },
+            { id: 'reddit', name: 'Reddit', status: 'NOT_CONFIGURED', liveStatus: 'NOT CONFIGURED', note: 'Waiting for approved OAuth credentials.' },
+            { id: 'news', name: 'News', status: 'UNAVAILABLE', liveStatus: 'UNAVAILABLE', note: 'Status loads after the API responds.' },
+          ]).map((connector) => <div className="source-readiness-item" key={connector.id}><span className="source-ready-icon"><Radio size={15} /></span><span><strong>{connector.name}</strong><small>{connector.note}</small></span><span className="source-disconnected">{connector.liveStatus ?? connector.status.replaceAll('_', ' ')}</span></div>)}</div></div>
         </section>
 
         <section className="pricing-section section-shell" id="pricing" aria-labelledby="pricing-title">
@@ -757,11 +815,12 @@ function App() {
           )}
         </section>
 
-        <section className="closing-section"><div className="closing-orbit" aria-hidden="true"><span /><span /><span /></div><div className="closing-content"><span className="eyebrow"><span className="eyebrow-signal"><span /></span> SOMETHING IS MOVING</span><h2>See it while<br /><span>it’s still becoming.</span></h2><p>One clear question can open a new line of sight.</p><button className="button button-primary" onClick={() => scrollToFinder(true)}>Find my first trend <ArrowRight size={17} /></button><small>Live source access is not connected in this preview.</small></div></section>
+        <section className="closing-section"><div className="closing-orbit" aria-hidden="true"><span /><span /><span /></div><div className="closing-content"><span className="eyebrow"><span className="eyebrow-signal"><span /></span> SOMETHING IS MOVING</span><h2>See it while<br /><span>it’s still becoming.</span></h2><p>One clear question can open a new line of sight.</p><button className="button button-primary" onClick={() => scrollToFinder(true)}>Find my first trend <ArrowRight size={17} /></button><small>Freshness is shown per source. Missing credentials are not filled with estimates.</small></div></section>
       </main>
 
       <footer className="site-footer"><div className="footer-main page-shell"><Brand compact /><p>See what’s rising before everyone else.</p><nav aria-label="Footer navigation"><a href="#method">Methodology</a><a href="#trust">Data & trust</a><a href="#pricing">Pricing</a></nav><span className="footer-build">PREVIEW BUILD · 2026</span></div><div className="footer-bottom page-shell"><span>© 2026 Kreovio. Built for early discovery.</span><span>Evidence over hype <i /> Signal over noise</span></div></footer>
       {activeTrend && <TrendModal trend={activeTrend} onClose={closeTrend} />}
+      {activeLive && <LiveModal trend={activeLive} onClose={() => setActiveLive(null)} />}
     </>
   );
 }

@@ -116,6 +116,7 @@ CREATE TABLE trend_searches (
   failure_code text,
   failure_message_safe text,
   source_coverage jsonb NOT NULL DEFAULT '{}'::jsonb,
+  report jsonb,
   started_at timestamptz,
   completed_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -459,3 +460,76 @@ CREATE TABLE background_jobs (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX background_jobs_ready_idx ON background_jobs(state, available_at) WHERE state IN ('queued', 'retrying');
+
+CREATE TABLE user_credentials (
+  user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  password_hash text NOT NULL,
+  password_salt text NOT NULL,
+  password_params jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE email_verifications (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash text NOT NULL UNIQUE,
+  expires_at timestamptz NOT NULL,
+  used_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX email_verifications_user_idx ON email_verifications(user_id, created_at DESC);
+
+CREATE TABLE sessions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash text NOT NULL UNIQUE,
+  csrf_secret text NOT NULL,
+  expires_at timestamptz NOT NULL,
+  revoked_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  last_seen_at timestamptz NOT NULL DEFAULT now(),
+  user_agent_hash text
+);
+CREATE INDEX sessions_user_idx ON sessions(user_id, expires_at DESC);
+
+CREATE TABLE source_freshness (
+  source_id text PRIMARY KEY REFERENCES trend_sources(id),
+  status text NOT NULL,
+  live_status text NOT NULL,
+  last_attempt_at timestamptz,
+  last_success_at timestamptz,
+  latest_signal_at timestamptz,
+  latency_ms integer,
+  requests integer NOT NULL DEFAULT 0,
+  estimated_cost_usd numeric(12, 6) NOT NULL DEFAULT 0,
+  limitation text,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE intelligence_cache (
+  cache_key text PRIMARY KEY,
+  algorithm_version text NOT NULL,
+  report jsonb NOT NULL,
+  fresh_until timestamptz NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX intelligence_cache_fresh_idx ON intelligence_cache(fresh_until);
+
+INSERT INTO trend_sources (id, display_name, adapter_version, enabled, source_weight, independent_group, license_name)
+VALUES
+  ('search', 'Search interest', '1.0.0', false, 0.80000, 'search', 'Requires a licensed search-trend provider'),
+  ('youtube', 'YouTube', '1.0.0', false, 0.75000, 'youtube', 'YouTube API Services'),
+  ('reddit', 'Reddit', '1.0.0', false, 0.65000, 'reddit', 'Reddit API'),
+  ('news', 'News', '1.0.0', true, 0.80000, 'news', 'GDELT DOC 2.0'),
+  ('wikipedia', 'Wikipedia attention', '1.0.0', true, 0.55000, 'wikipedia', 'Wikimedia REST API'),
+  ('hackernews', 'Hacker News', '1.0.0', true, 0.40000, 'hackernews', 'HN Algolia API')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO admin_settings (key, value)
+VALUES
+  ('kts_weights', '{"velocity":30,"crossSource":20,"acceleration":15,"freshness":15,"saturation":10,"geography":10}'::jsonb),
+  ('early_signal', '{"maxHours":72,"minAcceleration":0.67,"minConfidence":70,"maxSaturation":0.4,"minIndependentSources":2,"minSampleSize":10,"minScore":55}'::jsonb),
+  ('cache_ttl_seconds', '{"default":900}'::jsonb),
+  ('rate_limits', '{"search_per_minute":8,"auth_per_minute":8}'::jsonb)
+ON CONFLICT (key) DO NOTHING;

@@ -3,16 +3,22 @@ import assert from 'node:assert/strict';
 import {
   DEFAULT_WEIGHTS,
   calculateAcceleration,
+  calculateAccelerationFromIncrements,
   calculateConfidence,
   calculateFreshness,
   calculateGeographicStrength,
   calculateMomentumDecay,
   calculateSaturationOpportunity,
+  calculateSeriesAcceleration,
   calculateTrendScore,
   calculateVelocity,
+  classifySourceFreshness,
+  clusterSignals,
   deduplicateSignals,
   determineLifecycle,
   getSupportedWindows,
+  groundExplanation,
+  independentConfirmations,
   isEarlySignal,
   normalizeTopic,
   standardizeSignal,
@@ -103,4 +109,58 @@ test('freshness, lifecycle, early-signal thresholds and history-supported window
   assert.equal(isEarlySignal({ hoursSinceDetection: 12, acceleration: 0.8, confidence: 50, saturation: 0.2, independentSources: 3, sampleSize: 20, score: 72 }), false);
   assert.deepEqual(getSupportedWindows(7).map(({ id }) => id), ['6h', '24h', '3d', '7d']);
   assert.equal(Object.values(DEFAULT_WEIGHTS).reduce((sum, weight) => sum + weight, 0), 100);
+});
+
+test('1 to 4 does not become extreme growth velocity', () => {
+  assert.equal(calculateVelocity({ current: 4, baseline: 1 }), null);
+});
+
+test('rising increments accelerate more than a flat growth series', () => {
+  const accelerating = calculateAccelerationFromIncrements([4, 12, 35]);
+  const flat = calculateAccelerationFromIncrements([20, 20, 20]);
+  assert.ok(accelerating > flat);
+  assert.ok(accelerating > 0.5);
+  assert.equal(flat, 0.5);
+  assert.ok(calculateSeriesAcceleration([10, 14, 26, 61]) > calculateSeriesAcceleration([10, 30, 50, 70]));
+  assert.equal(calculateAccelerationFromIncrements([4, 12]), null);
+});
+
+test('one hundred syndicated copies are one confirmation, not one hundred', () => {
+  const copies = Array.from({ length: 100 }, (_, index) => ({
+    title: 'Shared syndicated headline about a market move',
+    source: 'news',
+    publisherId: `mirror-${index}`,
+    reference: `https://mirror${index}.example/story`,
+    timestamp: '2026-10-04T00:00:00Z',
+  }));
+  const result = independentConfirmations(copies);
+  assert.equal(result.stories, 1);
+  assert.equal(result.independentCount, 1);
+  assert.equal(result.duplicatesRemoved, 99);
+});
+
+test('topic clustering does not merge AI agents with AI regulation', () => {
+  const clusters = clusterSignals([
+    { title: 'AI browser agents are spreading' },
+    { title: 'Autonomous browser agents arrive' },
+    { title: 'AI regulation proposal advances' },
+  ], { query: 'artificial intelligence' });
+  const names = clusters.map((cluster) => cluster.canonicalName.toLowerCase());
+  assert.equal(clusters.length, 2);
+  assert.ok(names.some((name) => name.includes('agent')));
+  assert.ok(names.some((name) => name.includes('regulation')));
+});
+
+test('explanations cannot introduce unsupported numbers', () => {
+  const grounded = groundExplanation('Coverage rose by 82 percent. The baseline was 10.', [10]);
+  assert.equal(grounded.text, 'The baseline was 10.');
+  assert.equal(grounded.removed.length, 1);
+});
+
+test('freshness thresholds are per source, not universal', () => {
+  const recentNews = classifySourceFreshness({ ageSeconds: 30 * 60, connectorStatus: 'CONNECTED', thresholds: { liveSec: 20 * 60, nearLiveSec: 2 * 60 * 60, recentSec: 12 * 60 * 60, staleSec: 36 * 60 * 60 } });
+  const sameAgeWiki = classifySourceFreshness({ ageSeconds: 30 * 60, connectorStatus: 'CONNECTED', thresholds: { liveSec: 26 * 60 * 60, nearLiveSec: 40 * 60 * 60, recentSec: 72 * 60 * 60, staleSec: 8 * 24 * 60 * 60 } });
+  assert.equal(recentNews, 'NEAR LIVE');
+  assert.equal(sameAgeWiki, 'LIVE');
+  assert.equal(classifySourceFreshness({ ageSeconds: null, connectorStatus: 'NOT_CONFIGURED' }), 'NOT CONFIGURED');
 });
