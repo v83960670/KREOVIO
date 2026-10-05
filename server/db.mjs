@@ -25,6 +25,7 @@ export function wrapPglite(db) {
         async query(text, params) {
           return normalize(await db.query(text, params));
         },
+        async exec(text) { return db.exec(text); },
         release() { release(); },
       };
     },
@@ -62,7 +63,7 @@ export async function createPool({ databaseUrl = process.env.DATABASE_URL, dataD
   return wrapPglite(db);
 }
 
-export async function migrate(pool) {
+async function migrateBase(pool) {
   const users = await pool.query(`SELECT to_regclass('public.users') AS name`);
   if (!users.rows[0]?.name) {
     if (typeof pool.exec === 'function') await pool.exec(schemaSql);
@@ -95,4 +96,24 @@ export async function releaseExpiredReservations(pool, releaseSearch) {
     } catch { /* Another worker may have finalized it. */ }
   }
   return released;
+}
+
+export async function migrate(pool) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    if (pool.kind === 'postgres') await client.query('SELECT pg_advisory_xact_lock(83960670)');
+    const runner = {query:(text,params)=>client.query(text,params),exec:(text)=>client.query(text)};
+    // Multi-statement schema requires PGlite exec instead of prepared query.
+    if (pool.kind === 'pglite') runner.exec = (text)=>client.exec(text);
+    const base = await migrateBase(runner);
+    await client.query('CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())');
+    const exists = await client.query('SELECT version FROM schema_migrations WHERE version=$1',['003']);
+    if (!exists.rowCount) {
+      await runner.exec(readFileSync(join(root, 'db/migrations/003_topic_history.sql'), 'utf8'));
+      await client.query('INSERT INTO schema_migrations(version) VALUES($1)',['003']);
+    }
+    await client.query('COMMIT');
+    return {applied:base.applied || (!exists.rowCount ? '003_topic_history.sql' : null)};
+  } catch(error) {await client.query('ROLLBACK');throw error;} finally {client.release();}
 }

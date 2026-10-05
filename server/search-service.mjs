@@ -1,14 +1,18 @@
+import { publicSource } from './source-health.mjs';
+import { discoverCandidates, enrichHistory, storeObservations } from './discovery.mjs';
+import { trackTopic, createCollectionQueue, reserveProviderBudget } from './collection-queue.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { buildAnalysis } from './analyze.mjs';
 import { SCORE_VERSION, SOURCE_CATALOG, selectedSourceIds } from './config.mjs';
 import { commitSearch, releaseSearch, reserveSearch } from './credit-ledger.mjs';
 import { logEvent } from './log.mjs';
-import { ADAPTERS } from './sources/adapters.mjs';
+import { ADAPTERS, sourceConfigHash, healthCheckSource } from './sources/adapters.mjs';
 import { classifySourceFreshness } from './trend-engine.mjs';
 import { FRESHNESS_THRESHOLDS } from './config.mjs';
 
 function cacheKeyFor(input) {
   return createHash('sha256').update(JSON.stringify({
+    mode: input.mode ?? 'analyze',
     query: input.query.trim().toLocaleLowerCase('en'),
     country: input.country,
     language: input.language,
@@ -16,30 +20,6 @@ function cacheKeyFor(input) {
     timeWindow: input.timeWindow,
     version: SCORE_VERSION,
   })).digest('hex');
-}
-
-function publicSource(source) {
-  const age = source.freshness?.latestSignalAt ? Math.max(0, Math.round((Date.now() - new Date(source.freshness.latestSignalAt).getTime()) / 1000)) : source.freshness?.dataAgeSeconds ?? null;
-  return {
-    id: source.id,
-    name: source.name,
-    status: source.status,
-    liveStatus: classifySourceFreshness({
-      ageSeconds: age,
-      connectorStatus: source.status,
-      thresholds: FRESHNESS_THRESHOLDS[source.id],
-    }),
-    lastAttemptAt: source.freshness?.lastAttemptAt ?? null,
-    lastSuccessAt: source.freshness?.lastSuccessAt ?? null,
-    latestSignalAt: source.freshness?.latestSignalAt ?? null,
-    dataAgeSeconds: age,
-    latencyMs: source.latencyMs ?? null,
-    note: source.limitations?.[0] ?? '',
-    limitations: source.limitations ?? [],
-    provider: source.provider ?? null,
-    requests: source.requests ?? 0,
-    estimatedCostUsd: source.estimatedCostUsd ?? 0,
-  };
 }
 
 function refreshCachedSources(sources = []) {
@@ -66,9 +46,10 @@ async function writeCache(pool, key, report) {
 async function rememberSource(pool, source) {
   const row = publicSource(source);
   await pool.query(
-    `INSERT INTO source_freshness (source_id, status, live_status, last_attempt_at, last_success_at, latest_signal_at, latency_ms, requests, estimated_cost_usd, limitation, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+    `INSERT INTO source_freshness (source_id, status, live_status, last_attempt_at, last_success_at, latest_signal_at, latency_ms, requests, estimated_cost_usd, limitation, config_hash, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
      ON CONFLICT (source_id) DO UPDATE SET
+       config_hash = EXCLUDED.config_hash,
        status = EXCLUDED.status,
        live_status = EXCLUDED.live_status,
        last_attempt_at = EXCLUDED.last_attempt_at,
@@ -79,7 +60,7 @@ async function rememberSource(pool, source) {
        estimated_cost_usd = source_freshness.estimated_cost_usd + EXCLUDED.estimated_cost_usd,
        limitation = EXCLUDED.limitation,
        updated_at = now()`,
-    [row.id, row.status, row.liveStatus, row.lastAttemptAt, row.lastSuccessAt, row.latestSignalAt, row.latencyMs, row.requests, row.estimatedCostUsd, row.note],
+    [row.id, row.status, row.liveStatus, row.lastAttemptAt, row.lastSuccessAt, row.latestSignalAt, row.latencyMs, row.requests, row.estimatedCostUsd, row.note, sourceConfigHash(source.id)],
   );
   await pool.query(
     `INSERT INTO source_health (source_id, state, latency_ms, success_count, failure_count, freshness_lag_seconds, safe_error_code)
@@ -122,7 +103,7 @@ async function persistSignals(client, sourceResults) {
           signal.publisherId,
           signal.reference,
           signal.reference ? createHash('sha256').update(String(signal.reference)).digest('hex') : null,
-          JSON.stringify({ provider: signal.metadata?.provider ?? source.id }),
+          JSON.stringify({ ...signal.metadata, provider: signal.metadata?.provider ?? source.id }),
         ],
       );
     }
@@ -201,6 +182,7 @@ function assembleReport({ searchId, input, analysis, sources, startedAt, cache }
   return {
     id: searchId,
     query: input.query,
+    mode: input.mode ?? 'analyze',
     country: input.country,
     language: input.language,
     sources: input.source,
@@ -229,6 +211,8 @@ function assembleReport({ searchId, input, analysis, sources, startedAt, cache }
 }
 
 export async function executeSearch(pool, { userId, input, requestId, idempotencyKey, onEvent = () => {}, collectors = ADAPTERS }) {
+  input = { ...input, mode: input.mode ?? 'analyze' };
+  if (!['analyze','discover'].includes(input.mode)) throw Object.assign(new Error('Choose analyze or discover.'), {status:400,code:'INVALID_MODE'});
   const startedAt = new Date().toISOString();
   onEvent('search_started', { requestId, at: startedAt });
   onEvent('entitlement_checked', { userId });
@@ -245,10 +229,12 @@ export async function executeSearch(pool, { userId, input, requestId, idempotenc
   onEvent('credit_reserved', { searchId: reservation.search_id, replay: reservation.idempotentReplay });
   if (reservation.idempotentReplay && reservation.status === 'committed') {
     const existing = await pool.query(`SELECT report FROM trend_searches WHERE id = $1`, [reservation.search_id]);
-    if (existing.rows[0]?.report) return { ...existing.rows[0].report, charged: true, creditState: 'committed', idempotentReplay: true };
+    if (existing.rows[0]?.report) return { ...existing.rows[0].report, sourceFreshness:refreshCachedSources(existing.rows[0].report.sourceFreshness), charged: false, creditState: 'not_charged', idempotentReplay: true };
   }
+  if (reservation.idempotentReplay) throw Object.assign(new Error('This search request was already submitted. Use a new request key to retry.'), {status:409,code:'SEARCH_ALREADY_SUBMITTED',charged:false});
   const key = cacheKeyFor(input);
   try {
+    await trackTopic(pool, input);
     const cached = await readCache(pool, key);
     onEvent('cache_checked', { hit: Boolean(cached) });
     let sources;
@@ -276,6 +262,7 @@ export async function executeSearch(pool, { userId, input, requestId, idempotenc
       collected = await Promise.all(selectedSourceIds(input.source).map(async (sourceId) => {
         const catalog = SOURCE_CATALOG.find((source) => source.id === sourceId);
         try {
+          if (collectors === ADAPTERS && (await healthCheckSource(sourceId)).status !== 'NOT_CONFIGURED' && !await reserveProviderBudget(pool, sourceId)) return budgetLimited(sourceId);
           const result = await collectors[sourceId](input);
           result.quality = catalog?.weight ?? 0.5;
           onEvent('source_completed', { id: sourceId, status: result.status, signals: result.signals?.length ?? 0, latencyMs: result.latencyMs ?? 0 });
@@ -301,14 +288,21 @@ export async function executeSearch(pool, { userId, input, requestId, idempotenc
       for (const source of collected) {
         try { await rememberSource(pool, source); } catch (error) { logEvent('source_health_write_failed', { source: source.id, code: error.code }); }
       }
-      sources = collected.map(publicSource);
+      sources = collected.map((source) => publicSource(source));
       onEvent('normalizing', {});
       onEvent('deduplicating', {});
       onEvent('clustering', {});
       onEvent('comparing_history', {});
       onEvent('calculating_momentum', {});
       onEvent('scoring', {});
-      analysis = buildAnalysis({ ...input, sourceResults: collected.map((source) => ({ ...source, quality: source.quality })) });
+      const candidates = discoverCandidates(collected, input);
+      // Keep evidence even when no candidate yet qualifies for a scored report.
+      await persistSignals(pool, collected);
+      await storeObservations(pool, input, collected, candidates);
+      for (const candidate of candidates) await trackTopic(pool, {...input,query:candidate.name,mode:'analyze'}, 'discovered', 10);
+      const enriched = await enrichHistory(pool,input,collected,candidates);
+      analysis = buildAnalysis({ ...input, candidates, sourceResults: enriched });
+      for (const result of analysis.results) if (result.lifecycle === 'accelerating') await trackTopic(pool,{...input,query:result.name,mode:'analyze'},'accelerating',70);
       onEvent('verifying', { qualified: analysis.stats?.qualified ?? 0 });
     }
     if (!analysis.ok) {
@@ -378,34 +372,40 @@ export async function executeSearch(pool, { userId, input, requestId, idempotenc
   }
 }
 
-export async function refreshTrackedTopic(pool) {
-  const recent = await pool.query(
-    `SELECT query, country_code, language_code, source_filter, time_window
-       FROM trend_searches WHERE status = 'succeeded' ORDER BY completed_at DESC NULLS LAST LIMIT 1`,
-  );
-  if (!recent.rowCount) return { refreshed: false };
-  const row = recent.rows[0];
-  const input = { query: row.query, country: row.country_code, language: row.language_code, source: row.source_filter, timeWindow: row.time_window };
-  const collected = await Promise.all(selectedSourceIds(input.source).map(async (sourceId) => {
-    try { return await ADAPTERS[sourceId](input); } catch {
-      return { id: sourceId, name: sourceId, status: 'UNAVAILABLE', signals: [], series: [], limitations: ['Background refresh failed.'], requests: 0, estimatedCostUsd: 0, latencyMs: 0, freshness: {} };
+function budgetLimited(sourceId) {
+  return {id:sourceId,name:sourceId,status:'RATE_LIMITED',signals:[],series:[],
+    limitations:['Local daily provider budget reached.'],freshness:{lastAttemptAt:new Date().toISOString()},requests:0};
+}
+
+export async function refreshTrackedTopic(pool, {queue=createCollectionQueue(pool), collectors=ADAPTERS} = {}) {
+  const job = await queue.claim();
+  if (!job) return {refreshed:false};
+  try {
+    const input = job.input;
+    const collected = [];
+    for (const id of selectedSourceIds(input.source)) {
+      let source;
+      if ((collectors !== ADAPTERS || (await healthCheckSource(id)).status !== 'NOT_CONFIGURED') && !await reserveProviderBudget(pool,id)) source=budgetLimited(id);
+      else {
+        try {source=await collectors[id](input);} catch {source={id,name:id,status:'UNAVAILABLE',signals:[],series:[],freshness:{lastAttemptAt:new Date().toISOString()}};}
+      }
+      await rememberSource(pool,source);
+      collected.push(source);
     }
-  }));
-  for (const source of collected) {
-    try { await rememberSource(pool, source); } catch { /* health write is best-effort */ }
-  }
-  const analysis = buildAnalysis({ ...input, sourceResults: collected });
-  if (!analysis.ok) return { refreshed: false, code: analysis.code };
-  const report = assembleReport({
-    searchId: null,
-    input,
-    analysis,
-    sources: collected.map(publicSource),
-    startedAt: new Date().toISOString(),
-    cache: 'refresh',
-  });
-  await writeCache(pool, cacheKeyFor(input), report);
-  return { refreshed: true, qualified: analysis.stats.qualified };
+    const candidates=discoverCandidates(collected,input);
+    await persistSignals(pool,collected);
+    await storeObservations(pool,input,collected,candidates);
+    for (const candidate of candidates) if (input.mode === 'discover') await trackTopic(pool,{...input,query:candidate.name,mode:'analyze'},'discovered',10);
+    const enriched=await enrichHistory(pool,input,collected,candidates);
+    const analysis=buildAnalysis({...input,candidates,sourceResults:enriched});
+    if (analysis.ok) {
+      const report=assembleReport({searchId:null,input,analysis,sources:collected.map((s)=>publicSource(s)),startedAt:new Date().toISOString(),cache:'refresh'});
+      await writeCache(pool,cacheKeyFor(input),report);
+      for (const result of analysis.results) if (result.lifecycle === 'accelerating') await trackTopic(pool,{...input,query:result.name,mode:'analyze'},'accelerating',70);
+    }
+    await queue.finish(job,analysis.ok ? null : 'INSUFFICIENT_EVIDENCE');
+    return {refreshed:analysis.ok,qualified:analysis.results.length};
+  } catch(error) {await queue.finish(job,error.code || 'COLLECTION_FAILED'); throw error;}
 }
 
 export async function getOwnedReport(pool, { userId, searchId }) {
@@ -414,7 +414,7 @@ export async function getOwnedReport(pool, { userId, searchId }) {
     [searchId, userId],
   );
   if (!found.rowCount || !found.rows[0].report) return null;
-  return { ...found.rows[0].report, charged: false, creditState: 'not_charged', reopened: true };
+  return { ...found.rows[0].report, sourceFreshness: refreshCachedSources(found.rows[0].report.sourceFreshness), charged: false, creditState: 'not_charged', reopened: true };
 }
 
 export { publicSource };

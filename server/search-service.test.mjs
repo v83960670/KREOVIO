@@ -78,3 +78,28 @@ test('unavailable collectors release the credit and invent nothing', async () =>
   assert.equal(balance.rows[0].available, 1);
   await pool.end();
 });
+
+test('discovery saves unscored evidence and refreshes stale status on free reopen', async () => {
+  const pool=await createPool({memory:true});await migrate(pool);
+  try {
+    const userId=randomUUID();
+    await pool.query(`INSERT INTO users(id,auth_subject,email,email_verified_at) VALUES($1,$2,$3,now())`,[userId,`local:${userId}`,`${userId}@example.test`]);
+    await grantFirstFreeSearch(pool,{userId,requestId:randomUUID()});
+    const at=new Date().toISOString();
+    const report=await executeSearch(pool,{userId,requestId:randomUUID(),idempotencyKey:randomUUID(),
+      input:{mode:'discover',query:'Fitness',country:'IN',language:'en',source:'youtube',timeWindow:'1h'},
+      collectors:{youtube:async()=>({id:'youtube',name:'YouTube',status:'CONNECTED',series:[],
+        signals:[{source:'youtube',sourceId:'video1',title:'Zone two training',topic:'Zone two training',timestamp:at,collectedAt:at,metric:'views_per_hour_since_publish',metricValue:12,sourceConfidence:0.7,reference:'https://youtube.com/watch?v=video1'}],
+        freshness:{lastAttemptAt:at,lastSuccessAt:at,latestSignalAt:at}})}});
+    assert.equal(report.mode,'discover');assert.equal(report.results.length,0);
+    assert.equal(report.observations[0].historyStatus,'INSUFFICIENT_HISTORY');assert.equal(report.observations[0].score,null);
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM topic_observations')).rows[0].n,2);
+    assert.equal((await pool.query('SELECT status FROM source_freshness WHERE source_id=$1',['youtube'])).rows[0].status,'CONNECTED');
+    const old=new Date(Date.now()-7*86400000).toISOString();
+    report.sourceFreshness[0].lastSuccessAt=old;
+    await pool.query('UPDATE trend_searches SET report=$2::jsonb WHERE id=$1',[report.id,JSON.stringify(report)]);
+    const reopened=await getOwnedReport(pool,{userId,searchId:report.id});
+    assert.equal(reopened.charged,false);assert.equal(reopened.sourceFreshness[0].liveStatus,'STALE');
+    assert.equal(await getOwnedReport(pool,{userId:randomUUID(),searchId:report.id}),null);
+  } finally {await pool.end();}
+});

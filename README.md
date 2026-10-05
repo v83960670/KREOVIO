@@ -4,7 +4,7 @@
 
 Kreovio is a trend-intelligence product foundation focused on early discovery: finding movement, measuring it against history, exposing its evidence, and keeping trend score separate from confidence.
 
-> **Honest status:** Kreovio now runs a real analysis pipeline: official/public collectors, deterministic scoring, credit reserve/commit/release, verified-account authentication, and PostgreSQL persistence (local PGlite, or `DATABASE_URL`). It is **not production-ready**. YouTube, Reddit, and licensed search-trend providers stay `NOT CONFIGURED` until credentials are supplied. News (GDELT), Wikipedia pageviews, and Hacker News are implemented and will report `UNAVAILABLE` if this runtime cannot open TLS to them. Sample report values remain labelled illustrative and are not returned by Trend Search.
+> **Honest status:** Kreovio now runs a real analysis pipeline: official/public collectors, deterministic scoring, credit reserve/commit/release, verified-account authentication, and PostgreSQL persistence (local PGlite, or `DATABASE_URL`). It is **not production-ready**. YouTube, Reddit, and licensed search-trend providers stay `NOT CONFIGURED` while credentials are absent; configured connectors stay UNKNOWN until a successful provider collection. News (GDELT), Wikipedia pageviews, and Hacker News are implemented and will report `UNAVAILABLE` if this runtime cannot open TLS to them. Sample report values remain labelled illustrative and are not returned by Trend Search.
 
 ## Run locally
 
@@ -43,7 +43,7 @@ Optional API process settings: copy `.env.example` to `.env` and set `API_HOST` 
 - `POST /api/search` — authenticated search. Reserves one credit, collects configured sources, and commits only after a valid report. Failure releases the credit. `Accept: text/event-stream` streams real stages.
 - `GET /api/reports/:id` — reopen a stored report. Costs zero credits.
 
-The preview API includes a small in-memory request throttle for local testing. It is **not** a distributed production rate limiter and is not an identity or abuse-control system.
+Request throttling uses atomic shared PostgreSQL counters. Configure trusted ingress and retention before operating multiple replicas; this is not a complete abuse-control system.
 
 ## Scoring and trust rules
 
@@ -58,7 +58,7 @@ Authentication, the credit ledger, and PostgreSQL persistence are wired. The fol
 1. Provision managed PostgreSQL and set `DATABASE_URL`. Local PGlite is real PostgreSQL SQL for development, not a managed production database.
 2. Supply `YOUTUBE_API_KEY`, Reddit OAuth credentials, and a licensed search-trend key such as `SERPAPI_API_KEY`. Without them those connectors stay `NOT CONFIGURED`.
 3. Run the API somewhere that can open TLS to GDELT, Wikimedia, and Hacker News. This sandbox cannot; those connectors then report `UNAVAILABLE` and invent nothing.
-4. Wire SMTP. Verification currently uses a local mailbox token when `SMTP_URL` is unset.
+4. Configure Resend (`EMAIL_API_KEY`, `EMAIL_FROM`) and verify your sending domain. Local mailbox verification is development-only; production configuration rejects missing email setup.
 5. Add payment-provider adapters, webhook signature checks, and server-verified checkout. The payment boundary is fail-closed and no checkout is registered.
 6. Replace the in-process cache/worker with a durable queue, distributed rate limiting, retention jobs, and operational alerts.
 7. Complete privacy/terms, export/deletion, load tests, and a deployment CSP review.
@@ -76,3 +76,9 @@ server/credit-ledger.mjs  PostgreSQL reserve / commit / release
 server/db.mjs             PGlite or DATABASE_URL
 db/schema.sql             PostgreSQL schema
 ```
+
+## Discovery and launch preparation
+
+Trend Finder has `discover` (broad category) and `analyze` (specific topic) modes in the existing interface. Candidates come from provider related queries/topics or literal evidence phrases/titles. Newly observed candidates are stored with `INSUFFICIENT_HISTORY`; missing acceleration and score remain null. No LLM generates candidates or scores.
+
+See [the implementation audit and deployment runbook](docs/LAUNCH.md) for collection semantics, provider credentials, queue budgets, production configuration, and remaining limitations. PR #2 remains unmerged; implementation and mocked tests do not establish that providers are live.

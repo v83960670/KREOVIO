@@ -11,7 +11,8 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
     "test": "node --test",
-    "start:api": "node server/index.mjs"
+    "start:api": "node server/index.mjs",
+    "worker": "node --env-file-if-exists=.env server/worker.mjs"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.8",

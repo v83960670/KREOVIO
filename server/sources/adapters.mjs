@@ -23,7 +23,7 @@ function freshness(sourceId, status, latestSignalAt, collectedAt) {
     status,
     liveStatus: classifySourceFreshness({ ageSeconds, connectorStatus: status, thresholds: FRESHNESS_THRESHOLDS[sourceId] }),
     lastAttemptAt: new Date().toISOString(),
-    lastSuccessAt: status === 'CONNECTED' || status === 'DEGRADED' || status === 'RATE_LIMITED' ? collectedAt : null,
+    lastSuccessAt: status === 'CONNECTED' || (status === 'DEGRADED' && latestSignalAt) ? collectedAt : null,
     latestSignalAt: latestSignalAt ?? null,
     dataAgeSeconds: ageSeconds,
     thresholds: FRESHNESS_THRESHOLDS[sourceId],
@@ -197,7 +197,7 @@ export async function collectNews({ query, country = 'WORLDWIDE', language = 'en
       limitations.push('GDELT did not return an article-count timeline, so news velocity cannot be calculated from this response.');
     }
   }
-  const status = signals.length || series.length ? 'CONNECTED' : (listResponse.status === 'RATE_LIMITED' ? 'RATE_LIMITED' : 'DEGRADED');
+  const status = signals.length && series.length && listResponse.ok && timelineResponse.ok ? 'CONNECTED' : (signals.length || series.length ? 'DEGRADED' : listResponse.status === 'RATE_LIMITED' ? 'RATE_LIMITED' : 'DEGRADED');
   return {
     id: 'news',
     name,
@@ -252,16 +252,17 @@ export async function collectWikipedia({ query, country = 'WORLDWIDE', language 
   let latest = null;
   let requests = 1;
   let latencyMs = search.latencyMs;
+  let partial = false;
   for (const title of titles) {
     const encoded = encodeURIComponent(title.replace(/ /g, '_'));
     const url = `https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/${project}/all-access/user/${encoded}/daily/${stamp(start)}/${stamp(end)}`;
     const response = await requestText(url, { timeoutMs: 12_000 });
     requests += 1;
     latencyMs += response.latencyMs;
-    if (!response.ok) continue;
+    if (!response.ok) {partial=true;continue;}
     const body = parseJson(response.text);
     const items = body.json?.items;
-    if (!Array.isArray(items)) continue;
+    if (!Array.isArray(items)) {partial=true;continue;}
     const points = [];
     for (const item of items) {
       const timestamp = wikiDate(item.timestamp);
@@ -333,10 +334,11 @@ export async function collectWikipedia({ query, country = 'WORLDWIDE', language 
         }
       }
     } else {
+      partial = true;
       geographicNote = `The ${ISO_COUNTRY[country] ?? country} Wikipedia top list could not be loaded. Geographic strength was not inferred.`;
     }
   }
-  const status = series.length ? 'CONNECTED' : 'DEGRADED';
+  const status = series.length && !partial ? 'CONNECTED' : 'DEGRADED';
   return {
     id: 'wikipedia',
     name,
@@ -439,7 +441,8 @@ export async function collectYouTube({ query, country = 'WORLDWIDE', language = 
     return failed('youtube', 'YouTube', search.status, search.code, note, search.latencyMs);
   }
   const parsed = parseJson(search.text);
-  const ids = (parsed.json?.items ?? []).map((item) => item.id?.videoId).filter(Boolean);
+  if (!Array.isArray(parsed.json?.items)) return failed('youtube', 'YouTube', 'DEGRADED', 'BAD_RESPONSE', 'YouTube returned an invalid search response.', search.latencyMs);
+  const ids = parsed.json.items.map((item) => item.id?.videoId).filter(Boolean);
   if (!ids.length) {
     return {
       id: 'youtube', name: 'YouTube', status: 'CONNECTED', signals: [], series: [], requests: 1, estimatedCostUsd: 0, latencyMs: search.latencyMs,
@@ -449,8 +452,9 @@ export async function collectYouTube({ query, country = 'WORLDWIDE', language = 
   }
   const statsParams = new URLSearchParams({ part: 'snippet,statistics', id: ids.join(','), key });
   const stats = await requestText(`https://www.googleapis.com/youtube/v3/videos?${statsParams}`, { timeoutMs: 12_000 });
-  if (!stats.ok) return failed('youtube', 'YouTube', stats.status, stats.code, 'YouTube statistics could not be loaded. Partial video counts were not invented.', search.latencyMs + stats.latencyMs);
+  if (!stats.ok) return failed('youtube', 'YouTube', ['AUTHENTICATION_ERROR', 'RATE_LIMITED'].includes(stats.status) ? stats.status : 'DEGRADED', stats.code, 'YouTube statistics could not be loaded. Partial video counts were not invented.', search.latencyMs + stats.latencyMs);
   const body = parseJson(stats.text);
+  if (!Array.isArray(body.json?.items)) return failed('youtube', 'YouTube', 'DEGRADED', 'BAD_RESPONSE', 'YouTube returned invalid statistics.', stats.latencyMs);
   const collectedAt = new Date().toISOString();
   const signals = [];
   let latest = null;
@@ -522,11 +526,12 @@ export async function collectReddit({ query, country = 'WORLDWIDE', language = '
   if (!tokenResponse.ok) return failed('reddit', 'Reddit', tokenResponse.status, tokenResponse.code, 'Reddit authentication failed. No posts were invented.', tokenResponse.latencyMs);
   const token = parseJson(tokenResponse.text).json?.access_token;
   if (!token) return failed('reddit', 'Reddit', 'AUTHENTICATION_ERROR', 'NO_TOKEN', 'Reddit did not return an access token.', tokenResponse.latencyMs);
-  const windowMap = { '6h': 'hour', '24h': 'day', '3d': 'week', '7d': 'week', '30d': 'month', '90d': 'year' };
+  const windowMap = { '1h': 'hour', '6h': 'day', '24h': 'day', '3d': 'week', '7d': 'week', '30d': 'month', '90d': 'year' };
   const url = `https://oauth.reddit.com/search?q=${encodeURIComponent(query)}&sort=new&t=${windowMap[timeWindow] ?? 'day'}&limit=40&type=link&restrict_sr=false`;
   const response = await requestText(url, { auth: `Bearer ${token}`, headers: { 'User-Agent': 'kreovio/0.2' } });
   if (!response.ok) return failed('reddit', 'Reddit', response.status, response.code, 'Reddit search failed. No posts were invented.', tokenResponse.latencyMs + response.latencyMs);
-  const children = parseJson(response.text).json?.data?.children ?? [];
+  const children = parseJson(response.text).json?.data?.children;
+  if (!Array.isArray(children)) return failed('reddit', 'Reddit', 'DEGRADED', 'BAD_RESPONSE', 'Reddit returned invalid posts.', response.latencyMs);
   const collectedAt = new Date().toISOString();
   const cutoff = Date.now() - (WINDOW_MS[timeWindow] ?? WINDOW_MS['24h']);
   const signals = [];
@@ -555,7 +560,7 @@ export async function collectReddit({ query, country = 'WORLDWIDE', language = '
       publisherId: post.author ? `reddit:${post.author}` : null,
       engagement: isNumber(post.num_comments) ? post.num_comments : null,
       sourceConfidence: 0.55,
-      metadata: { provider: 'reddit-oauth', comments: post.num_comments ?? null, countryRequested: country, languageRequested: language },
+      metadata: { provider: 'reddit-oauth', community: post.subreddit_name_prefixed ?? null, comments: post.num_comments ?? null, countryRequested: country, languageRequested: language },
     });
     if (!latest || timestamp > latest) latest = timestamp;
   }
@@ -577,10 +582,10 @@ export async function collectReddit({ query, country = 'WORLDWIDE', language = '
   };
 }
 
-export async function collectSearchInterest({ query, country = 'WORLDWIDE', language = 'en', timeWindow = '24h' }) {
+async function collectSerpApiInterest({ query, country = 'WORLDWIDE', language = 'en', timeWindow = '24h', mode = 'analyze' }) {
   const key = envFlag('SERPAPI_API_KEY');
   if (!key) return notConfigured('search', 'Search interest', 'No licensed search-trend provider key is configured. Relative interest was not estimated.');
-  const date = { '6h': 'now 1-d', '24h': 'now 7-d', '3d': 'now 7-d', '7d': 'today 1-m', '30d': 'today 3-m', '90d': 'today 12-m' }[timeWindow] ?? 'now 7-d';
+  const date = { '1h': 'now 1-d', '6h': 'now 1-d', '24h': 'now 7-d', '3d': 'now 7-d', '7d': 'today 1-m', '30d': 'today 3-m', '90d': 'today 12-m' }[timeWindow] ?? 'now 7-d';
   const params = new URLSearchParams({ engine: 'google_trends', q: query, data_type: 'TIMESERIES', date, api_key: key });
   if (country !== 'WORLDWIDE') params.set('geo', country);
   if (language) params.set('hl', language);
@@ -600,10 +605,42 @@ export async function collectSearchInterest({ query, country = 'WORLDWIDE', lang
     points.push({ t: raw, value });
   }
   const latest = points.length ? points[points.length - 1].t : null;
+  const candidates = [], geographicSeries = [];
+  let requests = 1, latencyMs = response.latencyMs, partial = false;
+  if (mode === 'discover') {
+    for (const type of ['RELATED_QUERIES','RELATED_TOPICS','GEO_MAP_0']) {
+      params.set('data_type',type);
+      const related = await requestText(`https://serpapi.com/search.json?${params}`, {timeoutMs:15000});
+      requests++; latencyMs += related.latencyMs;
+      const data = parseJson(related.text).json;
+      if (!related.ok || !data || data.error) {partial=true; continue;}
+      if (type === 'GEO_MAP_0') {
+        const regions = data.interest_by_region;
+        if (!Array.isArray(regions)) {partial=true; continue;}
+        for (const region of regions) {
+          const value=region.extracted_value ?? region.values?.[0]?.extracted_value;
+          if (isNumber(value)) geographicSeries.push({country:region.geo ?? null,label:region.location,metric:'relative_interest',unit:'relative_index',points:[{t:collectedAt,value}],geographicMethod:'provider_relative_interest'});
+        }
+        continue;
+      }
+      const root = type === 'RELATED_QUERIES' ? data.related_queries : data.related_topics;
+      if (!root || (!Array.isArray(root.top) && !Array.isArray(root.rising))) {partial=true;continue;}
+      for (const kind of ['top','rising']) for (const item of root[kind] ?? []) {
+        const name=item.query ?? item.topic?.title;
+        if (typeof name !== 'string') continue;
+        candidates.push({name,kind:`${type.toLowerCase()}_${kind}`,evidence:{source:'search',title:name,topic:name,
+          sourceId:`serpapi:${type}:${name}`,timestamp:collectedAt,collectedAt,reference:item.link ?? null,
+          metric:'provider_related_interest',metricValue:isNumber(item.extracted_value) ? item.extracted_value : null,
+          metricUnit:'relative_index_or_growth',publisherId:'serpapi',metadata:{kind,provider:'serpapi-google-trends',displayValue:item.value ?? null}}});
+      }
+    }
+  }
+  const status = points.length && !partial ? 'CONNECTED' : 'DEGRADED';
   return {
+    candidates, geographicSeries,
     id: 'search',
     name: 'Search interest',
-    status: points.length ? 'CONNECTED' : 'DEGRADED',
+    status,
     signals: points.slice(-1).map((point) => ({
       source: 'search',
       sourceId: `serpapi:${query}:${point.t}`,
@@ -635,14 +672,23 @@ export async function collectSearchInterest({ query, country = 'WORLDWIDE', lang
     }] : [],
     limitations: [
       'Relative interest is an index, usually 0–100. It is not monthly search volume and is never converted into a search count.',
-      'Provider samples and indexing delays apply. This is not every search on the internet.',
+      'SerpAPI is a third-party provider, not Google’s official Trends API. Provider sampling and indexing delays apply.',
+      ...(partial ? ['Some related-interest or geography requests failed; partial evidence only.'] : []),
     ],
-    requests: 1,
-    estimatedCostUsd: Number(process.env.SERPAPI_COST_PER_CALL_USD ?? 0.01),
-    latencyMs: response.latencyMs,
+    requests,
+    estimatedCostUsd: requests * Number(process.env.SERPAPI_COST_PER_CALL_USD ?? 0.01),
+    latencyMs,
     provider: 'SerpAPI Google Trends',
-    freshness: freshness('search', points.length ? 'CONNECTED' : 'DEGRADED', latest, collectedAt),
+    freshness: freshness('search', status, latest, collectedAt),
   };
+}
+
+// Provider registry is the extension point for official Google Trends access when granted.
+export const SEARCH_PROVIDERS = Object.freeze({serpapi: collectSerpApiInterest});
+export async function collectSearchInterest(input) {
+  const provider = process.env.SEARCH_INTEREST_PROVIDER || 'serpapi';
+  if (!SEARCH_PROVIDERS[provider]) return notConfigured('search','Search interest','REQUIRES_PROVIDER_APPROVAL: official Google Trends access/adapter is not available.');
+  return SEARCH_PROVIDERS[provider](input);
 }
 
 export const ADAPTERS = Object.freeze({
@@ -654,12 +700,14 @@ export const ADAPTERS = Object.freeze({
   hackernews: collectHackerNews,
 });
 
+export function sourceConfigHash(sourceId) {
+  const keys = {youtube:['YOUTUBE_API_KEY'],reddit:['REDDIT_CLIENT_ID','REDDIT_CLIENT_SECRET'],search:['SERPAPI_API_KEY','SEARCH_INTEREST_PROVIDER']};
+  return createHash('sha256').update(JSON.stringify((keys[sourceId] ?? []).map((key)=>envFlag(key)))).digest('hex');
+}
 export async function healthCheckSource(sourceId) {
-  if (sourceId === 'youtube') return envFlag('YOUTUBE_API_KEY') ? { id: sourceId, status: 'CONNECTED', note: 'API key present. Quota is checked on collection.' } : { id: sourceId, status: 'NOT_CONFIGURED', note: 'YOUTUBE_API_KEY is not set.' };
-  if (sourceId === 'reddit') return envFlag('REDDIT_CLIENT_ID') && envFlag('REDDIT_CLIENT_SECRET') ? { id: sourceId, status: 'CONNECTED', note: 'OAuth credentials present.' } : { id: sourceId, status: 'NOT_CONFIGURED', note: 'Reddit OAuth credentials are not set.' };
-  if (sourceId === 'search') return envFlag('SERPAPI_API_KEY') ? { id: sourceId, status: 'CONNECTED', note: 'SerpAPI key present.' } : { id: sourceId, status: 'NOT_CONFIGURED', note: 'SERPAPI_API_KEY is not set.' };
-  if (sourceId === 'news') return { id: sourceId, status: 'CONNECTED', note: 'GDELT DOC 2.0 requires no key. Live status is known only after a collection attempt.' };
-  if (sourceId === 'wikipedia') return { id: sourceId, status: 'CONNECTED', note: 'Wikimedia Pageviews requires no key. Counts are pageviews, not searches.' };
-  if (sourceId === 'hackernews') return { id: sourceId, status: 'CONNECTED', note: 'HN Algolia requires no key. It is one community, not Reddit.' };
-  return { id: sourceId, status: 'UNAVAILABLE', note: 'Unknown source.' };
+  if (sourceId === 'search' && process.env.SEARCH_INTEREST_PROVIDER && process.env.SEARCH_INTEREST_PROVIDER !== 'serpapi') return {id:sourceId,status:'NOT_CONFIGURED',note:'REQUIRES_PROVIDER_APPROVAL: official Google Trends is not available.'};
+  const required = { youtube: ['YOUTUBE_API_KEY'], reddit: ['REDDIT_CLIENT_ID', 'REDDIT_CLIENT_SECRET'], search: ['SERPAPI_API_KEY'] };
+  if (required[sourceId]?.some((key) => !envFlag(key))) return { id: sourceId, status: 'NOT_CONFIGURED', note: 'REQUIRES_CREDENTIALS' };
+  if (!ADAPTERS[sourceId]) return { id: sourceId, status: 'UNAVAILABLE', note: 'Unknown source.' };
+  return { id: sourceId, status: 'UNKNOWN', configHash: sourceConfigHash(sourceId), note: 'No successful provider collection has been verified.' };
 }

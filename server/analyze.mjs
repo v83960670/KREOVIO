@@ -1,3 +1,4 @@
+import { discoverCandidates, matchesTopic } from './discovery.mjs';
 import { ISO_COUNTRY, SCORE_VERSION, WINDOW_MS } from './config.mjs';
 import {
   DEFAULT_EARLY_SIGNAL,
@@ -49,19 +50,20 @@ function granularityMs(points) {
 }
 
 function windowTotals(points, windowMs, now) {
-  if (!points.length) return [];
-  const first = points[0].t;
+  if (points.length < 2) return [];
+  const grain = granularityMs(points);
+  if (!grain || grain > windowMs) return [];
+  const expected = Math.max(1, Math.round(windowMs / grain));
   const totals = [];
-  for (let cursor = first; cursor + windowMs <= now + 1_000; cursor += windowMs) {
+  for (let cursor = Math.floor(points[0].t/windowMs)*windowMs; cursor + windowMs <= now; cursor += windowMs) {
     const slice = points.filter((point) => point.t >= cursor && point.t < cursor + windowMs);
-    if (!slice.length) continue;
-    totals.push({
-      t: cursor + windowMs,
-      value: slice.reduce((sum, point) => sum + point.value, 0),
-      samples: slice.length,
-    });
+    if (slice.length < expected) continue;
+    totals.push({t:cursor + windowMs,value:slice.reduce((sum,point)=>sum+point.value,0),samples:slice.length});
   }
-  return totals;
+  // Only contiguous windows ending at the latest supplied complete bucket can measure acceleration.
+  let start = totals.length - 1;
+  while (start > 0 && totals[start].t-totals[start-1].t === windowMs) start--;
+  return totals.slice(Math.max(0,start));
 }
 
 function direction(current, baseline) {
@@ -79,7 +81,15 @@ function assessSeries(series, { windowMs, now }) {
     .sort((a, b) => a.t - b.t);
   const grain = granularityMs(points);
   const tooCoarse = isNumber(grain) && grain > windowMs * 1.5;
-  const totals = tooCoarse ? [] : windowTotals(points, windowMs, now);
+  let totals = tooCoarse ? [] : windowTotals(points, windowMs, now);
+  if (series.stored) {
+    // Stored values are rolling sample counts. Summing them double-counts records.
+    totals = points.filter((point) => point.t + windowMs <= now).map((point) => ({...point, samples:1}));
+    let start = totals.length - 1;
+    while (start > 0 && totals[start].t - totals[start-1].t === windowMs) start--;
+    totals = totals.slice(Math.max(0,start));
+    if (!totals.length || now - totals.at(-1).t > windowMs * 2) totals = [];
+  }
   const history = totals.slice(0, -2);
   const baseline = history.length >= 2 ? median(history.map((point) => point.value)) : null;
   const current = totals.at(-1) ?? null;
@@ -109,6 +119,8 @@ function assessSeries(series, { windowMs, now }) {
   const peak = totals.length ? Math.max(...totals.map((point) => point.value)) : null;
   return {
     sourceId: series.sourceId,
+    historyProvenance: series.provenance ?? null,
+    collectedAt: series.collectedAt ?? null,
     label: series.label,
     metric: series.metric,
     unit: series.unit,
@@ -146,7 +158,7 @@ function evidenceFromSeries(series, sourceName) {
     value: round(latest.value),
     unit: series.unit,
     timestamp: new Date(latest.t).toISOString(),
-    collectedAt: null,
+    collectedAt: series.collectedAt,
     reference: null,
     note: series.tooCoarse ? 'Series is coarser than the selected window, so it was not used for velocity.' : 'Observed series point. Gaps were not filled with zeroes.',
   }];
@@ -169,7 +181,7 @@ function buildExplanation(item) {
   else add(`Growth velocity scored ${item.velocity} on a 0 to 1 scale after minimum-volume protection.`, [item.velocity]);
   if (item.acceleration == null) add('Acceleration is unavailable because there are not enough historical observations.', []);
   else add(`Acceleration scored ${item.acceleration} on a 0 to 1 scale, where 0.5 means the rate of growth is flat.`, [item.acceleration]);
-  if (item.independentSources != null) add(`${item.independentSources} independent source family confirmed measurable movement.`, [item.independentSources]);
+  if (item.independentSources != null) add(`${item.independentSources} independent source families supplied evidence (movement requires separate historical measurements).`, [item.independentSources]);
   if (item.duplicateCount) add(`${item.duplicateCount} duplicate or syndicated records were collapsed and did not increase confirmation.`, [item.duplicateCount]);
   if (!item.geographicAvailable) add('Geographic strength is unavailable for this result.', []);
   if (item.saturationState === 'INSUFFICIENT EVIDENCE') add('Saturation is insufficient evidence. No competition percentage was estimated.', []);
@@ -188,6 +200,8 @@ function qualifies(item) {
 
 export function buildAnalysis({
   query,
+  mode = 'analyze',
+  candidates: suppliedCandidates,
   country = 'WORLDWIDE',
   language = 'en',
   timeWindow = '24h',
@@ -196,6 +210,32 @@ export function buildAnalysis({
   earlyThresholds = DEFAULT_EARLY_SIGNAL,
   now = Date.now(),
 }) {
+  if (mode === 'discover') {
+    const candidates = suppliedCandidates ?? discoverCandidates(sourceResults, {query, language});
+    const results = [], observations = [];
+    for (const candidate of candidates) {
+      const scoped = sourceResults.map((source) => ({ ...source,
+        signals: (source.signals ?? []).filter((signal) => matchesTopic(signal, candidate.name)),
+        series: (source.series ?? []).filter((series) => normalizeTopic(series.article ?? '') === normalizeTopic(candidate.name)),
+      }));
+      const analysis = buildAnalysis({query:candidate.name, country, language, timeWindow, sourceResults:scoped, weights, earlyThresholds, now});
+      results.push(...analysis.results);
+      if (!analysis.results.length) observations.push({
+        name:candidate.name, clusterKey:candidate.key, evidenceCount:candidate.evidence.length,
+        evidence:candidate.evidence, score:analysis.topicAssessment?.score ?? null,
+        acceleration:analysis.topicAssessment?.acceleration ?? null,
+        confidence:analysis.topicAssessment?.confidence ?? null, lifecycle:'observed', earlySignal:false,
+        scoreStatus:analysis.topicAssessment?.scoreStatus ?? 'insufficient_evidence',
+        historyStatus:analysis.topicAssessment?.acceleration != null ? 'OBSERVED_HISTORY' : 'INSUFFICIENT_HISTORY',
+        reason:analysis.topicAssessment?.acceleration != null ? 'Observed history does not meet rising-trend thresholds.' : 'INSUFFICIENT_HISTORY — observed evidence saved; acceleration and Trend Score are withheld.',
+      });
+    }
+    results.sort((a,b) => (b.score ?? -1)-(a.score ?? -1) || a.name.localeCompare(b.name));
+    return {ok:candidates.length > 0, code:results.length ? 'READY' : candidates.length ? 'INSUFFICIENT_HISTORY' : 'INSUFFICIENT_EVIDENCE',
+      message:results.length ? 'Rising topics supported by observed history.' : candidates.length ? 'Candidates saved as observed. More history is needed to establish rising movement.' : 'No candidate topics could be supported by source evidence.',
+      results:results.map((r,i)=>({...r,rank:i+1})), observations, topicAssessment:null,
+      stats:{signalsCollected:sourceResults.reduce((n,s)=>n+(s.signals?.length ?? 0),0), clusters:candidates.length, qualified:results.length}};
+  }
   const windowMs = WINDOW_MS[timeWindow] ?? WINDOW_MS['24h'];
   const active = sourceResults.filter((source) => source.signals?.length || source.series?.length);
   const failedSources = sourceResults.filter((source) => !source.signals?.length && !source.series?.length);
@@ -265,21 +305,21 @@ export function buildAnalysis({
 
   const groups = new Map();
   for (const series of seriesBundles) {
-    const key = series.article ? normalizeTopic(series.article) : `query:${series.sourceId}`;
+    const key = series.article && normalizeTopic(series.article) !== normalizeTopic(query) ? normalizeTopic(series.article) : `query:${normalizeTopic(query)}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(series);
   }
-  if (seriesBundles.some((series) => !series.article)) {
-    const parent = seriesBundles.filter((series) => !series.article || normalizeTopic(series.article) === normalizeTopic(query));
-    groups.set(`query:${normalizeTopic(query)}`, parent);
-  }
+
 
   const candidates = [];
   for (const [key, bundle] of groups) {
     const usable = bundle.filter((series) => !series.tooCoarse && (series.velocity != null || series.acceleration != null || series.points.length >= 4));
     if (!usable.length) continue;
     const primary = usable.slice().sort((a, b) => (b.points.length - a.points.length))[0];
-    const sources = [...new Set(usable.map((series) => series.sourceId))];
+    const topicName = primary.article || query;
+    const matchingSignals = deduped.filter((signal) => matchesTopic(signal, topicName));
+    // A source family contributes once. Copies collapsed across families do not add votes.
+    const sources = [...new Set([...usable.map((series) => series.sourceId), ...matchingSignals.map((signal) => signal.source)])];
     const sourceObjects = sources.map((id) => {
       const match = active.find((source) => source.id === id);
       return { id, independent: true, quality: match?.quality ?? primary.quality ?? 0.6 };
@@ -301,8 +341,13 @@ export function buildAnalysis({
     };
     const saturation = null;
     const scored = scoreWithProvenance(features, weights);
+    if (primary.acceleration == null || primary.velocity == null) {
+      scored.score = null;
+      scored.status = 'insufficient_evidence';
+      for (const dimension of Object.values(scored.dimensions)) dimension.contribution = null;
+    }
     const historicalHours = primary.points.length >= 2 ? (primary.points.at(-1).t - primary.points[0].t) / 3_600_000 : null;
-    const sampleSize = primary.points.length + deduped.filter((signal) => sources.includes(signal.source)).length;
+    const sampleSize = primary.points.length + matchingSignals.length;
     const confidence = calculateConfidence({
       sourceQuality: sourceObjects.reduce((sum, source) => sum + source.quality, 0) / sourceObjects.length,
       independentSources: sources.length,
@@ -385,6 +430,7 @@ export function buildAnalysis({
       scoreCoverage: scored.coverage,
       scoreVersion: SCORE_VERSION,
       provenance: scored.dimensions,
+      historyProvenance: primary.historyProvenance,
       confidence: confidence.confidence,
       confidenceLabel: confidence.label,
       lifecycle,
@@ -397,7 +443,7 @@ export function buildAnalysis({
       curve: primary.totals.slice(-30).map((point) => ({ t: new Date(point.t).toISOString(), value: round(point.value), metric: primary.metric })),
       evidence: [
         ...usable.flatMap((series) => evidenceFromSeries(series, series.sourceName)),
-        ...deduped.filter((signal) => sources.includes(signal.source)).slice(0, 8).map((signal) => ({
+        ...matchingSignals.slice(0, 8).map((signal) => ({
           source: signal.source,
           title: signal.title,
           publisher: signal.publisherId ?? signal.authorOrPublisher ?? null,
@@ -410,10 +456,11 @@ export function buildAnalysis({
         })),
       ],
       limitations: [
+        primary.metric === 'sampled_record_count' ? 'Repeated API sample counts, not exhaustive publication counts. Missing collection buckets remain missing; sample caps and query scope apply.' : null,
         primary.tooCoarse ? 'The source granularity is coarser than the selected window.' : null,
         primary.metric === 'wikipedia_pageviews' ? 'Pageviews are Wikipedia attention, not search volume.' : null,
         primary.metric === 'relative_interest' ? 'Relative interest was not converted into search volume.' : null,
-        primary.metric === 'article_count' ? 'Article counts are from the provider sample after duplicate collapse.' : null,
+        primary.metric === 'article_count' ? 'Provider timeline counts may include syndicated articles; they do not establish independent confirmation.' : null,
         country !== 'WORLDWIDE' && !geographicAvailable ? 'Geographic strength unavailable.' : null,
       ].filter(Boolean),
       related,

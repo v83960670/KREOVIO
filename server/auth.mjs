@@ -1,3 +1,4 @@
+import { deliverVerification } from './runtime.mjs';
 import { createHash, randomBytes, randomUUID, scrypt, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { grantFirstFreeSearch } from './credit-ledger.mjs';
@@ -93,11 +94,12 @@ export async function registerUser(pool, { email, password, requestId }) {
   } finally {
     client.release();
   }
+  const delivery = await deliverVerification(normalized,token).catch(() => 'delivery-failed');
   return {
     userId,
     email: normalized,
     verificationToken: token,
-    delivery: process.env.SMTP_URL ? 'smtp-not-wired' : 'local-mailbox',
+    delivery,
     requestId,
   };
 }
@@ -193,4 +195,13 @@ export function assertCsrf(session, headerToken, origin, host, forwardedHost) {
     || originHost.endsWith('.e2b.app')
     || (process.env.APP_ORIGIN && origin === process.env.APP_ORIGIN);
   if (!allowed) throw fail('CSRF_FAILED', 'The request origin was rejected.', 403);
+}
+
+export async function resendVerification(pool,userId) {
+  const user=await pool.query(`SELECT email,email_verified_at FROM users WHERE id=$1`,[userId]);
+  if (!user.rows[0] || user.rows[0].email_verified_at) return {delivery:'not-needed'};
+  const token=randomBytes(32).toString('hex');
+  await pool.query(`INSERT INTO email_verifications(user_id,token_hash,expires_at) VALUES($1,$2,now()+interval '24 hours')`,[userId,sha256(token)]);
+  const delivery=await deliverVerification(user.rows[0].email,token).catch(()=>'delivery-failed');
+  return {delivery,verificationToken:delivery==='local-mailbox' ? token : undefined};
 }

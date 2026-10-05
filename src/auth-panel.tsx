@@ -53,6 +53,19 @@ export default function AuthPanel({ account, onChange }: { account: Account | nu
     }
   };
 
+  const resend = async () => {
+    setBusy(true);
+    setError(false);
+    try {
+      const result = await api<{delivery: string; verificationToken?: string}>('/api/auth/resend-verification', {
+        method: 'POST', headers: {'X-CSRF-Token': account?.csrf ?? ''},
+      });
+      if (result.verificationToken) setToken(result.verificationToken);
+      setMessage(result.delivery === 'email' ? 'A new verification code was emailed to you.' : result.delivery === 'local-mailbox' ? 'A new local verification code is ready.' : 'Email delivery failed. Please try again later.');
+    } catch {setError(true); setMessage('Could not resend verification. Please try again later.');}
+    finally {setBusy(false);}
+  };
+
   const logout = async () => {
     await api('/api/auth/logout', { method: 'POST' });
     onChange({ authenticated: false });
@@ -73,6 +86,7 @@ export default function AuthPanel({ account, onChange }: { account: Account | nu
         )}
         <div className="auth-actions">
           {!account.emailVerified && <button type="button" onClick={verify} disabled={busy || token.length < 32}>Verify email</button>}
+          {!account.emailVerified && <button type="button" onClick={resend} disabled={busy}>Resend code</button>}
           <button type="button" onClick={logout}>Sign out</button>
         </div>
         {message && <p className={error ? 'auth-error' : 'auth-note'}>{message}</p>}
@@ -92,7 +106,7 @@ export default function AuthPanel({ account, onChange }: { account: Account | nu
       <label>Email<input type="email" autoComplete="email" required value={email} onChange={(event) => setEmail(event.target.value)} /></label>
       <label>Password<input type="password" autoComplete={mode === 'register' ? 'new-password' : 'current-password'} required minLength={10} value={password} onChange={(event) => setPassword(event.target.value)} /></label>
       <button className="button button-primary auth-submit" type="submit" disabled={busy}>{busy ? 'Working…' : mode === 'register' ? 'Create account' : 'Sign in'} <ArrowRight size={15} /></button>
-      <p className="auth-mail"><ShieldCheck size={13} /> Email delivery is not configured in this environment. A verification token is returned to this session after registration.</p>
+      <p className="auth-mail"><ShieldCheck size={13} /> Verify your email to receive your free search. Local development provides a verification code in this session.</p>
       {token && <label className="auth-token">Verification token<input value={token} onChange={(event) => setToken(event.target.value)} aria-label="Verification token" /></label>}
       {token && <button type="button" onClick={verify} disabled={busy}>Verify this account</button>}
       {message && <p className={error ? 'auth-error' : 'auth-note'} role={error ? 'alert' : 'status'}>{message}</p>}

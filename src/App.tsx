@@ -66,6 +66,7 @@ const SOURCES = [
 ];
 
 const TIME_WINDOWS = [
+  { value: '1h', label: 'Past hour' },
   { value: '6h', label: 'Past 6 hours' },
   { value: '24h', label: 'Past 24 hours' },
   { value: '3d', label: 'Past 3 days' },
@@ -510,6 +511,7 @@ function App() {
   const [pricing, setPricing] = useState<Pricing | null>(null);
   const [currency, setCurrency] = useState('INR');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [mode, setMode] = useState('discover');
   const [searchMessage, setSearchMessage] = useState('');
   const [searchError, setSearchError] = useState(false);
   const [reportVisible, setReportVisible] = useState(false);
@@ -584,7 +586,7 @@ function App() {
     setSearchMessage('');
     setSearchError(false);
     try {
-      const report = await streamSearch({ query: cleanQuery, country, language, source, timeWindow: windowId }, account.csrf, (name, data) => {
+      const report = await streamSearch({ mode, query: cleanQuery, country, language, source, timeWindow: windowId }, account.csrf, (name, data) => {
         if (name === 'source_completed') {
           const sourceId = String(data.id ?? 'source');
           const sourceStatus = String(data.status ?? '').replaceAll('_', ' ').toLowerCase();
@@ -688,7 +690,11 @@ function App() {
           <div className="finder-layout">
             <form className="search-console" onSubmit={submitSearch} noValidate>
               <div className="console-topline"><span><Radio size={14} /> INTELLIGENCE ENGINE</span><span className="console-mode">{status?.liveSearchEnabled ? 'FRESHNESS SHOWN' : 'SOURCES LIMITED'} <i /></span></div>
-              <label className="query-label" htmlFor="trend-query">What do you want to explore?</label>
+              <div className="view-toggle" role="group" aria-label="Search mode">
+                <button type="button" className={mode === 'discover' ? 'active' : ''} aria-pressed={mode === 'discover'} onClick={() => setMode('discover')}>Discover niches</button>
+                <button type="button" className={mode === 'analyze' ? 'active' : ''} aria-pressed={mode === 'analyze'} onClick={() => setMode('analyze')}>Analyze topic</button>
+              </div>
+              <label className="query-label" htmlFor="trend-query">{mode === 'discover' ? 'Which broad category do you want to explore?' : 'Which topic do you want to analyze?'}</label>
               <div className={`query-input-wrap${searchError && !query.trim() ? ' input-error' : ''}`}>
                 <Search size={21} aria-hidden="true" />
                 <input id="trend-query" ref={searchInputRef} type="text" maxLength={100} placeholder="A topic, niche or question…" value={query} onChange={(event) => { setQuery(event.target.value); if (searchMessage) setSearchMessage(''); }} aria-describedby="query-help search-feedback" />
@@ -703,7 +709,7 @@ function App() {
                 <SelectField label="TIME WINDOW" value={windowId} options={TIME_WINDOWS} onChange={setWindowId} icon={Clock3} />
               </div>
               <div className="console-actions">
-                <button className="button button-primary scan-button" type="submit" disabled={isSubmitting}><span className="scan-button-icon">{isSubmitting ? <span className="button-pulse" /> : <Sparkles size={17} />}</span>{isSubmitting ? 'Collecting signals…' : 'Scan for emerging trends'}<ArrowRight size={17} /></button>
+                <button className="button button-primary scan-button" type="submit" disabled={isSubmitting}><span className="scan-button-icon">{isSubmitting ? <span className="button-pulse" /> : <Sparkles size={17} />}</span>{isSubmitting ? 'Collecting signals…' : mode === 'discover' ? 'Discover rising niches' : 'Analyze topic'}<ArrowRight size={17} /></button>
                 <span className="scan-cost"><LockKeyhole size={13} /> One search · one complete analysis</span>
               </div>
               {stages.length > 0 && <ol className="search-stages" aria-label="Search progress">{stages.map((stage) => <li key={stage}>{stage}</li>)}</ol>}

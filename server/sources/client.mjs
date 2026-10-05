@@ -26,7 +26,10 @@ export async function requestText(url, { method = 'GET', headers = {}, body, tim
     const text = await response.text();
     let status = 'CONNECTED';
     let code = null;
-    if (response.status === 401 || response.status === 403) {
+    if (response.status === 429 || (response.status === 403 && /quotaExceeded|dailyLimitExceeded|rateLimitExceeded/i.test(text))) {
+      status = 'RATE_LIMITED';
+      code = 'PROVIDER_QUOTA';
+    } else if (response.status === 401 || response.status === 403 || (response.status === 400 && /API_KEY_INVALID|keyInvalid|invalid_api_key/i.test(text))) {
       status = 'AUTHENTICATION_ERROR';
       code = `HTTP_${response.status}`;
     } else if (response.status === 429) {

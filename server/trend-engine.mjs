@@ -452,7 +452,7 @@ export function saturationLabel(value) {
 
 export function classifySourceFreshness({ ageSeconds, connectorStatus, thresholds }) {
   if (connectorStatus === 'NOT_CONFIGURED') return 'NOT CONFIGURED';
-  if (connectorStatus === 'AUTHENTICATION_ERROR') return 'UNAVAILABLE';
+  if (['AUTHENTICATION_ERROR', 'UNKNOWN', 'CONFIGURED'].includes(connectorStatus)) return 'UNAVAILABLE';
   if (!isNumber(ageSeconds)) {
     if (connectorStatus === 'RATE_LIMITED' || connectorStatus === 'DEGRADED') return 'DEGRADED';
     return 'UNAVAILABLE';

@@ -108,7 +108,7 @@ export async function reserveSearch(pool, {
   if (typeof idempotencyKey !== 'string' || idempotencyKey.length < 12 || idempotencyKey.length > 160) {
     throw safeError('INVALID_IDEMPOTENCY_KEY', 'A valid idempotency key is required.');
   }
-  if (!['6h', '24h', '3d', '7d', '30d', '90d'].includes(timeWindow)) {
+  if (!['1h', '6h', '24h', '3d', '7d', '30d', '90d'].includes(timeWindow)) {
     throw safeError('INVALID_TIME_WINDOW', 'The requested time window is not supported.');
   }
   if (typeof countryCode !== 'string' || (!/^([A-Za-z]{2}|WORLDWIDE)$/.test(countryCode))) {
@@ -126,11 +126,12 @@ export async function reserveSearch(pool, {
     // prevent parallel requests from spending the same last search credit.
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))', [userId]);
     const existing = await client.query(
-      `SELECT r.id AS reservation_id, r.search_id, r.status, r.credits_reserved, r.credits_consumed, s.status AS search_status
+      `SELECT r.user_id, r.id AS reservation_id, r.search_id, r.status, r.credits_reserved, r.credits_consumed, s.status AS search_status
          FROM usage_reservations r JOIN trend_searches s ON s.id = r.search_id
         WHERE r.idempotency_key = $1 FOR UPDATE OF r`,
       [idempotencyKey],
     );
+    if (existing.rowCount && existing.rows[0].user_id !== userId) throw safeError('INVALID_IDEMPOTENCY_KEY', 'Request key belongs to another account.');
     if (existing.rowCount) return { ...existing.rows[0], idempotentReplay: true };
 
     const userResult = await client.query(

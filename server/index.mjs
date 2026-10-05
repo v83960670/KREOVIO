@@ -1,3 +1,6 @@
+import { assertProductionConfig, allowRequest } from './runtime.mjs';
+import { healthSnapshot } from './source-health.mjs';
+import { trackTopic } from './collection-queue.mjs';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 
@@ -9,7 +12,7 @@ if (existsSync('.env')) {
   }
 }
 import { createServer } from 'node:http';
-import { accountSummary, assertCsrf, clearSessionCookie, createSession, hashIp, loginUser, readSession, registerUser, revokeSession, sessionCookie, verifyEmail } from './auth.mjs';
+import { accountSummary, assertCsrf, clearSessionCookie, createSession, hashIp, loginUser, readSession, registerUser, resendVerification, revokeSession, sessionCookie, verifyEmail } from './auth.mjs';
 import { releaseSearch } from './credit-ledger.mjs';
 import { SOURCE_CATALOG } from './config.mjs';
 import { createPool, migrate, releaseExpiredReservations } from './db.mjs';
@@ -21,10 +24,11 @@ import { healthCheckSource } from './sources/adapters.mjs';
 const caPath = '/usr/local/share/ca-certificates/e2b-ca.crt';
 if (existsSync(caPath) && !process.env.NODE_EXTRA_CA_CERTS) process.env.NODE_EXTRA_CA_CERTS = caPath;
 
+assertProductionConfig();
+
 const PORT = Number(process.env.API_PORT ?? 8787);
 const HOST = process.env.API_HOST ?? '0.0.0.0';
 const MAX_BODY = 20_000;
-const buckets = new Map();
 const ipSalt = process.env.AUTH_SECRET || randomUUID();
 
 function securityHeaders(extra = {}) {
@@ -73,23 +77,10 @@ function parseBody(request) {
   });
 }
 
-function allow(key, limit, windowMs = 60_000) {
-  const now = Date.now();
-  const current = buckets.get(key) ?? { start: now, count: 0 };
-  if (now - current.start >= windowMs) {
-    current.start = now;
-    current.count = 0;
-  }
-  current.count += 1;
-  buckets.set(key, current);
-  if (buckets.size > 5_000) {
-    for (const [entry, value] of buckets) if (now - value.start > windowMs) buckets.delete(entry);
-  }
-  return current.count <= limit;
-}
+async function allow(key,limit,windowMs=60000) { return pool ? allowRequest(pool,hashIp(key,ipSalt),limit,windowMs) : false; }
 
 function clientIp(request) {
-  return request.headers['x-forwarded-for']?.split(',')[0]?.trim() || request.socket.remoteAddress || 'unknown';
+  return (process.env.TRUST_PROXY === 'true' ? request.headers['x-forwarded-for']?.split(',')[0]?.trim() : null) || request.socket.remoteAddress || 'unknown';
 }
 
 function safeError(error) {
@@ -125,25 +116,15 @@ const server = createServer(async (request, response) => {
         const health = await healthCheckSource(source.id);
         let stored = null;
         if (pool) {
-          const row = await pool.query(`SELECT status, live_status, last_success_at, last_attempt_at, latest_signal_at, latency_ms, limitation FROM source_freshness WHERE source_id = $1`, [source.id]);
+          const row = await pool.query(`SELECT config_hash, status, live_status, last_success_at, last_attempt_at, latest_signal_at, latency_ms, limitation FROM source_freshness WHERE source_id = $1`, [source.id]);
           stored = row.rows[0] ?? null;
         }
-        return {
-          id: source.id,
-          name: source.name,
-          status: stored?.status ?? health.status,
-          liveStatus: stored?.live_status ?? (health.status === 'NOT_CONFIGURED' ? 'NOT CONFIGURED' : 'UNAVAILABLE'),
-          note: stored?.limitation || health.note,
-          lastSuccessAt: stored?.last_success_at ?? null,
-          lastAttemptAt: stored?.last_attempt_at ?? null,
-          latestSignalAt: stored?.latest_signal_at ?? null,
-          latencyMs: stored?.latency_ms ?? null,
-        };
+        return healthSnapshot(source,health,stored);
       }));
-      const configured = connectors.filter((connector) => connector.status !== 'NOT_CONFIGURED').length;
+      const verified = connectors.filter((connector) => connector.status === 'CONNECTED' && connector.liveStatus === 'LIVE').length;
       send(response, 200, {
         mode: 'analysis',
-        liveSearchEnabled: configured > 0 && Boolean(pool),
+        liveSearchEnabled: verified > 0 && Boolean(pool),
         persistence: persistence.kind,
         connectors,
         message: pool
@@ -170,13 +151,13 @@ const server = createServer(async (request, response) => {
         email: session.email,
         emailVerified: session.emailVerified,
         csrf: session.csrf,
-        verificationDelivery: process.env.SMTP_URL ? 'smtp-not-wired' : 'local-mailbox',
+        verificationDelivery: process.env.EMAIL_API_KEY ? 'email' : 'local-mailbox',
         ...summary,
       });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/auth/register') {
-      if (!allow(`auth:${clientIp(request)}`, 8)) { send(response, 429, { code: 'RATE_LIMITED', message: 'Too many attempts. Please wait.', charged: false }); return; }
+      if (!await allow(`auth:${clientIp(request)}`, 8)) { send(response, 429, { code: 'RATE_LIMITED', message: 'Too many attempts. Please wait.', charged: false }); return; }
       const body = await parseBody(request);
       const created = await registerUser(pool, { email: body.email, password: body.password, requestId: randomUUID() });
       const signed = await createSession(pool, { userId: created.userId, userAgent: request.headers['user-agent'] });
@@ -190,9 +171,16 @@ const server = createServer(async (request, response) => {
         verificationToken: created.delivery === 'local-mailbox' ? created.verificationToken : undefined,
         message: created.delivery === 'local-mailbox'
           ? 'Email delivery is not configured. Use the verification token from this response to verify the account. The free search is granted only after verification.'
-          : 'Account created. Email delivery is not wired, so verification cannot be completed by email yet.',
+          : created.delivery === 'email' ? 'Check your email for the verification code.' : 'Email delivery failed. Retry verification delivery after signing in.',
       }, { 'Set-Cookie': sessionCookie(signed.token, { secure: cookieSecure(request) }) });
       return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/auth/resend-verification') {
+      if (!session) {send(response,401,{code:'AUTH_REQUIRED'});return;}
+      assertCsrf(session,request.headers['x-csrf-token'],request.headers.origin,request.headers.host,request.headers['x-forwarded-host']);
+      if (!await allow(`resend:${session.userId}`,3,3600000)) {send(response,429,{code:'RATE_LIMITED'});return;}
+      const result=await resendVerification(pool,session.userId);
+      send(response,200,result);return;
     }
     if (request.method === 'POST' && url.pathname === '/api/auth/verify') {
       const body = await parseBody(request);
@@ -202,7 +190,7 @@ const server = createServer(async (request, response) => {
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/auth/login') {
-      if (!allow(`auth:${clientIp(request)}`, 8)) { send(response, 429, { code: 'RATE_LIMITED', message: 'Too many attempts. Please wait.', charged: false }); return; }
+      if (!await allow(`auth:${clientIp(request)}`, 8)) { send(response, 429, { code: 'RATE_LIMITED', message: 'Too many attempts. Please wait.', charged: false }); return; }
       const body = await parseBody(request);
       const user = await loginUser(pool, body);
       const signed = await createSession(pool, { userId: user.id, userAgent: request.headers['user-agent'] });
@@ -245,6 +233,8 @@ const server = createServer(async (request, response) => {
          ON CONFLICT (user_id, episode_id) DO UPDATE SET saved_at = now()`,
         [session.userId, body.episodeId, Number.isInteger(body.score) ? body.score : null, body.lifecycle ?? null],
       );
+      const topic = await pool.query(`SELECT t.canonical_name,e.country_code,e.language_code FROM trend_episodes e JOIN normalized_topics t ON t.id=e.topic_id WHERE e.id=$1`,[body.episodeId]);
+      if (topic.rows[0]) await trackTopic(pool,{query:topic.rows[0].canonical_name,country:topic.rows[0].country_code,language:topic.rows[0].language_code,source:'all',timeWindow:'24h',mode:'analyze'},'saved',90);
       send(response, 200, { saved: true, charged: false });
       return;
     }
@@ -261,13 +251,14 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === 'POST' && url.pathname === '/api/search') {
-      if (!allow(`search:${clientIp(request)}`, 8)) { send(response, 429, { code: 'RATE_LIMITED', message: 'Too many requests. Please try again shortly.', charged: false }); return; }
+      if (!await allow(`search:${clientIp(request)}`, 8)) { send(response, 429, { code: 'RATE_LIMITED', message: 'Too many requests. Please try again shortly.', charged: false }); return; }
       if (!pool) { send(response, 503, { code: 'PERSISTENCE_UNAVAILABLE', message: 'Search persistence is unavailable. Nothing was charged.', charged: false }); return; }
       if (!session) { send(response, 401, { code: 'AUTH_REQUIRED', message: 'Sign in with a verified account to run a Trend Search. Nothing was charged.', charged: false }); return; }
       assertCsrf(session, request.headers['x-csrf-token'], request.headers.origin, request.headers.host, request.headers['x-forwarded-host']);
       if (!session.emailVerified) { send(response, 403, { code: 'VERIFICATION_REQUIRED', message: 'Verify your email before using the free search. Nothing was charged.', charged: false }); return; }
       const body = await parseBody(request);
       const input = {
+        mode: typeof body.mode === 'string' ? body.mode : 'analyze',
         query: typeof body.query === 'string' ? body.query.trim() : '',
         country: typeof body.country === 'string' ? body.country : 'WORLDWIDE',
         language: typeof body.language === 'string' ? body.language : 'en',
@@ -322,7 +313,7 @@ const ready = (async () => {
     releaseExpiredReservations(pool, releaseSearch).catch((error) => logEvent('reservation_sweep_failed', { code: error.code }));
   }, 60_000).unref();
   setInterval(() => {
-    if (!pool) return;
+    if (!pool || process.env.BACKGROUND_COLLECTION !== 'true') return;
     refreshTrackedTopic(pool).catch((error) => logEvent('background_refresh_failed', { code: error.code }));
   }, 10 * 60_000).unref();
 })();

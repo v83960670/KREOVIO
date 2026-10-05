@@ -1,6 +1,7 @@
 export const SCORE_VERSION = 'KTS-1.0';
 
 export const WINDOW_MS = Object.freeze({
+  '1h': 60 * 60 * 1000,
   '6h': 6 * 60 * 60 * 1000,
   '24h': 24 * 60 * 60 * 1000,
   '3d': 3 * 24 * 60 * 60 * 1000,
@@ -10,6 +11,7 @@ export const WINDOW_MS = Object.freeze({
 });
 
 export const GDELT_TIMESPAN = Object.freeze({
+  '1h': '1h',
   '6h': '6h',
   '24h': '24h',
   '3d': '72h',
@@ -20,6 +22,7 @@ export const GDELT_TIMESPAN = Object.freeze({
 
 /** Timeline span used for baseline. Longer than the user window when the provider allows it. */
 export const GDELT_HISTORY_SPAN = Object.freeze({
+  '1h': '1d',
   '6h': '7d',
   '24h': '14d',
   '3d': '1m',
